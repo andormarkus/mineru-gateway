@@ -1,8 +1,8 @@
 """Shared task-flow helpers for the synchronous routes (``/file_parse``, ``/v1/ocr``).
 
-These are about *retrieving* a task's outcome after ingest, not about intake — so they live here
-rather than in ``ingest.py``. ``poll_task_until_terminal`` blocks until the scheduler finishes a
-queued task; ``fetch_result_or_none`` reads the stored result from S3.
+Polls the central task queue in PostgreSQL until the scheduler marks a task terminal.
+Worker status sync and result persistence are owned by the scheduler — gateway routes
+read task rows only.
 """
 
 from __future__ import annotations
@@ -11,21 +11,20 @@ import asyncio
 import logging
 import time
 
-import httpx
 from fastapi import Request
+from fastapi.responses import JSONResponse
 
 from mineru_gateway.cloud.base import CloudStorageProvider
 from mineru_gateway.db.base import get_db_session
 from mineru_gateway.db.models import Task
 from mineru_gateway.observability.metrics import metrics
-from mineru_gateway.tasks.results import fetch_and_store_result, read_result
-from mineru_gateway.tasks.status import refresh_task_from_upstream
+from mineru_gateway.tasks.results import read_result
+from mineru_gateway.tasks.status import TASK_COMPLETED, TASK_EXPIRED, TASK_FAILED
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_STATUSES = frozenset({"completed", "failed"})
+_FAILURE_STATUSES = frozenset({TASK_FAILED, TASK_EXPIRED})
 
-# Bound on how long a synchronous route polls the DB for the scheduler to finish a task.
 _POLL_ITERATIONS = 300
 _POLL_INTERVAL_SECONDS = 1.0
 
@@ -35,81 +34,73 @@ def get_store(request: Request) -> CloudStorageProvider | None:
     return getattr(request.app.state, "object_store", None)
 
 
-async def store_upstream_result_if_needed(task: Task, store: CloudStorageProvider, *, client: httpx.AsyncClient) -> None:
-    """Fetch a completed task's result from the worker and persist it to S3 when missing."""
-    if task.status != "completed" or task.result_key is not None:
-        return
-    if not task.upstream_task_id or not task.upstream_base_url:
-        return
-    try:
-        await fetch_and_store_result(
-            task_id=task.task_id,
-            upstream_task_id=task.upstream_task_id,
-            upstream_base_url=task.upstream_base_url,
-            store=store,
-            client=client,
-        )
-    except (httpx.HTTPError, OSError, KeyError) as exc:
-        logger.debug("Could not store upstream result for task %s: %s", task.task_id, exc)
+def is_poll_complete(row: Task) -> bool:
+    """True when the synchronous route can stop polling."""
+    if row.status == TASK_COMPLETED and bool(row.result_key):
+        return True
+    if row.status in _FAILURE_STATUSES:
+        return True
+    return row.client_expired_at is not None
 
 
-async def poll_task_until_terminal(
-    task_id: str, *, store: CloudStorageProvider | None = None, route: str = "unknown"
-) -> Task | None:
-    """Poll until the task reaches a terminal state (``completed``/``failed``).
+def client_sla_expired_response(task_id: str, *, status: str) -> JSONResponse:
+    """Return 202 when the client SLA expired but execution may still continue."""
+    return JSONResponse(
+        status_code=202,
+        content={
+            "task_id": task_id,
+            "status": status,
+            "client_sla_expired": True,
+            "message": "Client SLA expired; task execution continues. Check status and result endpoints.",
+            "status_url": f"/tasks/{task_id}",
+            "result_url": f"/tasks/{task_id}/result",
+        },
+    )
 
-    After dispatch, the scheduler only records upstream identifiers — this loop refreshes status from
-    the worker and, when ``store`` is provided, stores completed results to S3.
 
-    Returns the terminal row, or ``None`` if the task vanishes (deleted mid-flight). Does not raise
-    — the caller decides how to render a failure. Bounded by ``_POLL_ITERATIONS`` *
-    ``_POLL_INTERVAL_SECONDS`` (~5 min ceiling); on timeout returns the last-seen row (which is
-    non-terminal) so the caller can render "not ready yet".
+async def try_fetch_result_bytes(task_id: str, row: Task, store: CloudStorageProvider | None) -> bytes | None:
+    """Return durable result bytes when the task completed with a stored pointer."""
+    if store is None or row.status != TASK_COMPLETED or not row.result_key:
+        return None
+    return await fetch_result_or_none(task_id=task_id, store=store)
+
+
+async def _load_task(task_id: str) -> Task | None:
+    async with get_db_session() as session:
+        return await session.get(Task, task_id)
+
+
+async def poll_task_until_terminal(task_id: str, *, route: str = "unknown") -> Task | None:
+    """Poll the database until the task is ready to return to the client.
+
+    Returns a completed row with ``result_key``, a failed/expired row, ``None`` if the
+    task disappears, or the last-seen nonterminal row on timeout.
     """
     start = time.perf_counter()
     row: Task | None = None
     outcome = "timeout"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-        for i in range(_POLL_ITERATIONS):
-            row = await refresh_task_from_upstream(task_id, client=client)
-            if row is None:
-                logger.warning("Task %s disappeared while polling", task_id)
-                outcome = "disappeared"
-                metrics.record_poll_duration(
-                    route=route, outcome=outcome, duration_ms=(time.perf_counter() - start) * 1000
-                )
-                return None
-            if row.status in _TERMINAL_STATUSES:
-                if store is not None:
-                    await store_upstream_result_if_needed(row, store, client=client)
-                    async with get_db_session() as session:
-                        row = await session.get(Task, task_id)
-                logger.debug("Task %s reached terminal state %s after %d polls", task_id, row.status, i + 1)
-                outcome = row.status if row is not None else "unknown"
-                metrics.record_poll_duration(
-                    route=route, outcome=outcome, duration_ms=(time.perf_counter() - start) * 1000
-                )
-                return row
-            if i > 0 and i % 30 == 0:
-                logger.debug("Still polling task %s (status=%s, poll=%d)", task_id, row.status, i + 1)
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+    for i in range(_POLL_ITERATIONS):
+        row = await _load_task(task_id)
+        if row is None:
+            logger.warning("Task %s disappeared while polling", task_id)
+            outcome = "disappeared"
+            break
+        if is_poll_complete(row):
+            logger.debug("Task %s poll complete (status=%s) after %d polls", task_id, row.status, i + 1)
+            outcome = row.status
+            break
+        if i > 0 and i % 30 == 0:
+            logger.debug("Still polling task %s (status=%s, poll=%d)", task_id, row.status, i + 1)
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+    else:
+        logger.warning("Poll timeout for task %s — last status=%s", task_id, row.status if row else "unknown")
 
-    logger.warning(
-        "Poll timeout for task %s — last status=%s dispatch_state=%s",
-        task_id,
-        row.status if row else "unknown",
-        row.dispatch_state if row else "unknown",
-    )
     metrics.record_poll_duration(route=route, outcome=outcome, duration_ms=(time.perf_counter() - start) * 1000)
     return row
 
 
 async def fetch_result_or_none(task_id: str, store: CloudStorageProvider) -> bytes | None:
-    """Read a task's result ZIP from S3, or ``None`` if not stored yet (``KeyError`` swallowed).
-
-    Thin convenience wrapper around :func:`read_result` for the synchronous routes, which want a
-    soft "not ready" rather than an exception when the result pointer isn't set yet.
-    """
+    """Read a task's result ZIP from object storage, or ``None`` if not stored yet."""
     try:
         data, fmt = await read_result(task_id=task_id, store=store)
         logger.debug("Fetched result for task %s (%d bytes, format=%s)", task_id, len(data), fmt)

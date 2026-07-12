@@ -2,7 +2,7 @@
 
 The gateway does NOT push to workers. It stages the upload, computes the dedup hash, checks the cache
 (instant hit if found), uploads the payload bytes to S3 for the scheduler to fetch later, and inserts a
-``dispatch_state="queued"`` Task row. The scheduler process pulls from the queue and dispatches.
+``status="queued"`` Task row. The scheduler process pulls from the queue and dispatches.
 
 Dedup cache hits are handled synchronously (no ingest needed — the result is already in S3).
 """
@@ -12,46 +12,45 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import struct
 import tempfile
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from mineru_gateway.cloud.base import CloudStorageProvider
-from mineru_gateway.config import get_settings
-from mineru_gateway.db.base import get_db_session
-from mineru_gateway.db.models import Task
+from mineru_gateway.config import GatewaySettings
+from mineru_gateway.gateway.admission import enforce_byte_limit
 from mineru_gateway.mineru_compat import (
     MultipartPayload,
     StagedUpload,
-    stage_multipart_request,
+    normalize_upload_filename,
     validate_public_http_client_request,
 )
 from mineru_gateway.observability.metrics import metrics
 from mineru_gateway.protocol.ocr_models import OCRRequest
-from mineru_gateway.tasks.cache import (
-    compute_cache_key,
-    compute_content_sha256,
-    create_cache_hit_task,
-    lookup_cache,
-    populate_cache,
+from mineru_gateway.scheduler.cache_service import (
+    CacheService,
+    build_cache_options_from_payload,
+    compute_file_records_from_paths,
+    content_sha256_from_records,
 )
+from mineru_gateway.scheduler.task_repository import TaskRepository
+from mineru_gateway.tasks.storage import payload_key as object_payload_key
+from mineru_gateway.util.upload_paths import UnsafeUploadNameError, internal_upload_path, rewrite_staged_uploads
 
 logger = logging.getLogger(__name__)
-
-PAYLOAD_PREFIX = "payloads"
-
-_RESULT_AFFECTING_FIELDS = ("backend", "effort", "parse_method", "start_page_id", "end_page_id")
 
 _DEFAULT_BACKEND = "hybrid-engine"
 _DEFAULT_PARSE_METHOD = "auto"
 _DEFAULT_EFFORT = "medium"
+_READ_CHUNK_SIZE = 1 << 20
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +73,26 @@ class IngestResult:
 # ---------------------------------------------------------------------------
 
 
-async def ingest_task(request: Request, *, store: CloudStorageProvider | None = None, source: str = "tasks") -> IngestResult:
+async def ingest_task(
+    request: Request,
+    *,
+    store: CloudStorageProvider | None = None,
+    source: str = "tasks",
+    settings: GatewaySettings | None = None,
+    cache_service: CacheService | None = None,
+) -> IngestResult:
     """Stage a multipart upload from an HTTP request, then ingest it.
 
     Thin Request-coupled wrapper around :func:`ingest_payload` for the multipart routes
     (``/tasks``, ``/file_parse``). Returns immediately with 202 + task_id.
     """
-    payload = await stage_multipart_request(request)
+    resolved_settings = settings or request.app.state.settings
+    payload = await stage_bounded_multipart_request(request, settings=resolved_settings)
+    try:
+        rewrite_staged_uploads(payload)
+    except UnsafeUploadNameError as exc:
+        payload.cleanup()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         return await ingest_payload(
             payload,
@@ -89,6 +101,8 @@ async def ingest_task(request: Request, *, store: CloudStorageProvider | None = 
             skip_cache=_should_skip_cache(request),
             public_bind_exposed=getattr(request.app.state, "public_bind_exposed", False),
             allow_public_http_client=getattr(request.app.state, "allow_public_http_client", False),
+            settings=resolved_settings,
+            cache_service=cache_service,
         )
     finally:
         payload.cleanup()
@@ -102,6 +116,8 @@ async def ingest_payload(
     skip_cache: bool = False,
     public_bind_exposed: bool = False,
     allow_public_http_client: bool = False,
+    settings: GatewaySettings,
+    cache_service: CacheService | None = None,
 ) -> IngestResult:
     """Validate, hash, dedup-check, upload payload, insert queued Task row.
 
@@ -109,64 +125,85 @@ async def ingest_payload(
     which builds one from extracted document bytes instead of receiving a multipart upload) call this
     directly. The caller owns ``payload.cleanup()``.
     """
+    resolved_settings = settings
     _validate_http_client_policy(
         payload, public_bind_exposed=public_bind_exposed, allow_public_http_client=allow_public_http_client
     )
 
     file_names = [u.upload_name for u in payload.uploads]
-    content_sha256, options = _hash_staged_payload(payload)
+    file_records, options = _hash_staged_payload(payload, settings=resolved_settings)
     backend = options.get("backend", _DEFAULT_BACKEND)
     parse_method = options.get("parse_method", _DEFAULT_PARSE_METHOD)
+    cache_cfg = resolved_settings.cache
+    cache = cache_service
+    if cache is None and store is not None and cache_cfg.enabled:
+        cache = CacheService(resolved_settings, store)
+    task_repo = TaskRepository.for_gateway(resolved_settings)
 
-    # Dedup cache hit → instant complete, no ingest needed.
-    cache_key, options_hash = compute_cache_key(content_sha256=content_sha256, options=options)
-    cache_cfg = get_settings().cache
-    if not skip_cache and cache_cfg.enabled:
-        cache_entry = await lookup_cache(cache_key, ttl_seconds=cache_cfg.ttl_seconds)
-        if cache_entry is not None and cache_entry.result_key:
-            logger.info("Dedup cache hit for content_sha256=%s… (source=%s)", content_sha256[:12], source)
-            result = await _build_cache_hit_result(cache=cache_entry, file_names=file_names)
+    cache_key: str | None = None
+    options_hash: str | None = None
+    content_sha256: str | None = None
+
+    if not skip_cache and cache_cfg.enabled and cache is not None:
+        cache_key, options_hash = cache.compute_cache_key(file_records, options)
+        content_sha256 = content_sha256_from_records(file_records)
+        cache_entry = await cache.lookup(cache_key)
+        if cache_entry is not None and cache_entry.object_key:
+            logger.info("Dedup cache hit for cache_key=%s… (source=%s)", cache_key[:12], source)
+            result = await _build_cache_hit_result(
+                cache=cache_entry, file_names=file_names, store=store, cache_service=cache
+            )
             metrics.record_task_ingested(source=source, cache_hit=True, backend=backend)
             return result
 
-    # Upload payload bytes to S3 so the scheduler can fetch them at dispatch time.
-    task_id = str(uuid.uuid4())
-    payload_key = await _store_payload(task_id=task_id, payload=payload, store=store)
-    logger.info(
-        "Queued task %s (source=%s backend=%s files=%d payload_key=%s)",
-        task_id,
-        source,
-        backend,
-        len(file_names),
-        payload_key or "none",
-    )
-    logger.debug("Task %s options=%s file_names=%s", task_id, options, file_names)
+        if cache_key is not None:
+            try:
+                await cache.create_placeholder(
+                    cache_key=cache_key,
+                    content_sha256=content_sha256,
+                    options_hash=options_hash,
+                    backend=backend,
+                    parse_method=parse_method,
+                    effort=options.get("effort", _DEFAULT_EFFORT),
+                    ttl_seconds=cache_cfg.ttl_seconds,
+                )
+            except Exception:
+                logger.exception("Cache placeholder failed for %s — continuing without cache", cache_key[:12])
+                cache_key = None
 
-    # Insert the queued Task row + pre-populate the dedup cache entry.
-    await _insert_queued_task(
-        task_id=task_id,
-        file_names=file_names,
-        backend=backend,
-        parse_method=parse_method,
-        options=options,
-        payload_key=payload_key,
-        source=source,
-    )
-    await populate_cache(
-        cache_key=cache_key,
-        content_sha256=content_sha256,
-        options_hash=options_hash,
-        backend=backend,
-        parse_method=parse_method,
-        effort=options.get("effort", _DEFAULT_EFFORT),
-        result_key=None,
-        result_format="zip",
-        source_task_id=task_id,
-    )
+    task_id = str(uuid.uuid4())
+    payload_key: str | None = None
+    try:
+        payload_key = await _store_payload(task_id=task_id, payload=payload, store=store, settings=resolved_settings)
+        logger.info(
+            "Queued task %s (source=%s backend=%s files=%d payload_key=%s)",
+            task_id,
+            source,
+            backend,
+            len(file_names),
+            payload_key or "none",
+        )
+        await task_repo.create_queued_task(
+            task_id=task_id,
+            file_names=file_names,
+            backend=backend,
+            parse_method=parse_method,
+            options=options,
+            payload_key=payload_key,
+            source=source,
+            cache_key=cache_key,
+        )
+    except Exception:
+        if payload_key is not None and store is not None:
+            try:
+                await store.delete(payload_key)
+            except Exception:
+                logger.exception("Failed to delete orphan payload %s after task insert failure", payload_key)
+        raise
 
     metrics.record_task_ingested(source=source, cache_hit=False, backend=backend)
     return IngestResult(
-        task_id=task_id, cache_hit=False, status="pending", response=_pending_response(task_id=task_id, source=source)
+        task_id=task_id, cache_hit=False, status="queued", response=_pending_response(task_id=task_id, source=source)
     )
 
 
@@ -175,11 +212,13 @@ async def ingest_payload(
 # ---------------------------------------------------------------------------
 
 
-async def _build_cache_hit_result(*, cache: Any, file_names: list[str]) -> IngestResult:
-    """Create a completed task row from a dedup cache hit and wrap it in an IngestResult."""
+async def _build_cache_hit_result(
+    *, cache: Any, file_names: list[str], store: CloudStorageProvider | None, cache_service: CacheService
+) -> IngestResult:
     task_id = str(uuid.uuid4())
-    await create_cache_hit_task(task_id=task_id, cache=cache, file_names=file_names)
-    logger.debug("Created cache-hit task row %s (result_key=%s)", task_id, cache.result_key)
+    if store is None:
+        raise RuntimeError("Object store required for cache hits")
+    await cache_service.create_hit_task(task_id=task_id, cache=cache, file_names=file_names)
     return IngestResult(
         task_id=task_id,
         cache_hit=True,
@@ -188,45 +227,18 @@ async def _build_cache_hit_result(*, cache: Any, file_names: list[str]) -> Inges
     )
 
 
-async def _store_payload(*, task_id: str, payload: MultipartPayload, store: CloudStorageProvider | None) -> str | None:
+async def _store_payload(
+    *, task_id: str, payload: MultipartPayload, store: CloudStorageProvider | None, settings: GatewaySettings
+) -> str | None:
     """Pack + upload the payload to S3, returning the object key (or None when no store is configured)."""
     if store is None:
         logger.debug("Skipping payload upload for task %s — no object store configured", task_id)
         return None
-    payload_bytes = _pack_payload(payload)
-    payload_key = f"{PAYLOAD_PREFIX}/{task_id}.bin"
-    await store.put(key=payload_key, data=payload_bytes)
-    logger.debug("Stored payload for task %s at %s (%d bytes)", task_id, payload_key, len(payload_bytes))
-    return payload_key
-
-
-async def _insert_queued_task(
-    *,
-    task_id: str,
-    file_names: list[str],
-    backend: str,
-    parse_method: str,
-    options: dict[str, Any],
-    payload_key: str | None,
-    source: str,
-) -> None:
-    """Insert a ``dispatch_state="queued"`` Task row for the scheduler to pull."""
-    options_blob = {**options, "file_names": file_names}
-    async with get_db_session() as session:
-        session.add(
-            Task(
-                task_id=task_id,
-                backend=backend,
-                parse_method=parse_method,
-                file_names=file_names,
-                status="pending",
-                source=source,
-                dispatch_state="queued",
-                payload_key=payload_key,
-                options_blob=options_blob,
-            )
-        )
-        await session.commit()
+    payload_bytes = _pack_payload(payload, settings=settings)
+    key = object_payload_key(task_id)
+    await store.put(key=key, data=payload_bytes)
+    logger.debug("Stored payload for task %s at %s (%d bytes)", task_id, key, len(payload_bytes))
+    return key
 
 
 def _pending_response(*, task_id: str, source: str) -> JSONResponse:
@@ -235,7 +247,7 @@ def _pending_response(*, task_id: str, source: str) -> JSONResponse:
         status_code=202,
         content={
             "task_id": task_id,
-            "status": "pending",
+            "status": "queued",
             "source": source,
             "status_url": f"/tasks/{task_id}",
             "result_url": f"/tasks/{task_id}/result",
@@ -243,26 +255,87 @@ def _pending_response(*, task_id: str, source: str) -> JSONResponse:
     )
 
 
-def _hash_staged_payload(payload: MultipartPayload) -> tuple[str, dict[str, Any]]:
-    """Read staged files, compute content hash, and extract options dict."""
-    contents: list[bytes] = []
-    for upload in payload.uploads:
-        with open(upload.path, "rb") as f:
-            contents.append(f.read())
+def _hash_staged_payload(
+    payload: MultipartPayload, *, settings: GatewaySettings
+) -> tuple[list[tuple[str, str]], dict[str, Any]]:
+    """Hash staged files incrementally and extract cache options."""
+    file_names = [upload.upload_name for upload in payload.uploads]
+    paths = [upload.path for upload in payload.uploads]
+    file_records = compute_file_records_from_paths(file_names, paths, settings=settings)
+    options = build_cache_options_from_payload(payload.fields)
+    return file_records, options
 
-    content_sha256 = compute_content_sha256(contents)
 
-    options: dict[str, Any] = {}
-    for field_name, field_value in payload.fields:
-        if field_name in _RESULT_AFFECTING_FIELDS:
-            options[field_name] = field_value
-        elif field_name == "lang_list":
-            options.setdefault("lang_list", []).append(field_value)
+def _read_bounded_file(path: str, *, settings: GatewaySettings, label: str = "multipart upload") -> bytes:
+    """Read a staged file in chunks while enforcing the configured byte limit."""
+    chunks: list[bytes] = []
+    total = 0
+    with open(path, "rb") as handle:
+        while chunk := handle.read(_READ_CHUNK_SIZE):
+            total += len(chunk)
+            enforce_byte_limit(total, settings=settings, label=label)
+            chunks.append(chunk)
+    return b"".join(chunks)
 
-    if "lang_list" in options:
-        options["lang_list"] = sorted(options["lang_list"])
 
-    return content_sha256, options
+async def stage_bounded_multipart_request(request: Request, *, settings: GatewaySettings) -> MultipartPayload:
+    """Stage multipart uploads with per-chunk size enforcement.
+
+    MinerU's stock stager streams to disk but does not enforce gateway limits.
+    """
+    from mineru.cli.router import cleanup_path
+
+    temp_dir = tempfile.mkdtemp(prefix="mineru-gateway-request-")
+    uploads: list[StagedUpload] = []
+    fields: list[tuple[str, str]] = []
+    total_bytes = 0
+
+    try:
+        form = await request.form()
+        for key, value in form.multi_items():
+            if isinstance(value, StarletteUploadFile):
+                original_name = value.filename or f"upload-{uuid.uuid4()}"
+                filename = normalize_upload_filename(original_name)
+                destination = _build_upload_destination(temp_dir, filename)
+                with open(destination, "wb") as handle:
+                    while True:
+                        chunk = await value.read(_READ_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        enforce_byte_limit(total_bytes, settings=settings, label="multipart upload")
+                        handle.write(chunk)
+                uploads.append(
+                    StagedUpload(
+                        field_name=key,
+                        upload_name=original_name,
+                        content_type=value.content_type or "application/octet-stream",
+                        path=str(destination),
+                    )
+                )
+                await value.close()
+            else:
+                fields.append((key, str(value)))
+    except Exception:
+        cleanup_path(temp_dir)
+        raise
+
+    return MultipartPayload(temp_dir=temp_dir, fields=fields, uploads=uploads)
+
+
+def _build_upload_destination(upload_dir: str, filename: str) -> Path:
+    destination = Path(upload_dir) / filename
+    if not destination.exists():
+        return destination
+
+    base_name = Path(filename).stem
+    suffix = Path(filename).suffix
+    index = 2
+    while True:
+        candidate = Path(upload_dir) / f"{base_name}__upload_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def _should_skip_cache(request: Request) -> bool:
@@ -274,7 +347,7 @@ def _should_skip_cache(request: Request) -> bool:
     return "no-cache" in cache_control.lower()
 
 
-def _pack_payload(payload: MultipartPayload) -> bytes:
+def _pack_payload(payload: MultipartPayload, *, settings: GatewaySettings) -> bytes:
     """Pack the staged uploads + fields into a single blob for S3 storage.
 
     Format: JSON header (fields + upload metadata) followed by concatenated file bytes.
@@ -284,8 +357,7 @@ def _pack_payload(payload: MultipartPayload) -> bytes:
     file_chunks: list[bytes] = []
     offset = 0
     for upload in payload.uploads:
-        with open(upload.path, "rb") as f:
-            data = f.read()
+        data = _read_bounded_file(upload.path, settings=settings, label="multipart upload")
         header["uploads"].append(
             {
                 "field_name": upload.field_name,
@@ -327,6 +399,7 @@ def _validate_http_client_policy(
 async def extract_document(
     body: OCRRequest,
     *,
+    settings: GatewaySettings,
     public_bind_exposed: bool = False,
     allow_public_http_client: bool = False,
 ) -> tuple[bytes | None, str]:
@@ -334,11 +407,22 @@ async def extract_document(
 
     Returns ``(bytes, file_name)`` or ``(None, "")`` when the request carries no usable document.
     """
+    from mineru_gateway.gateway.admission import enforce_byte_limit
+
+    resolved_settings = settings
     doc = body.document
 
     if doc.type == "file" and doc.file:
         try:
-            return base64.b64decode(doc.file), doc.file_name or "document"
+            encoded = doc.file.strip()
+            padding = (-len(encoded)) % 4
+            estimated = (len(encoded) + padding) * 3 // 4
+            enforce_byte_limit(estimated, settings=resolved_settings, label="base64 document")
+            data = base64.b64decode(encoded, validate=True)
+            enforce_byte_limit(len(data), settings=resolved_settings, label="base64 document")
+            return data, doc.file_name or "document"
+        except HTTPException:
+            raise
         except Exception:
             logger.warning("Failed to base64-decode inline document file", exc_info=True)
             return None, ""
@@ -355,10 +439,19 @@ async def extract_document(
         )
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        enforce_byte_limit(total, settings=resolved_settings, label="downloaded document")
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
                 name = url.rsplit("/", 1)[-1] or "document"
-                return resp.content, name
+                return data, name
+        except HTTPException:
+            raise
         except Exception:
             logger.warning("Failed to fetch document from %s", url, exc_info=True)
             return None, ""
@@ -374,9 +467,8 @@ def build_payload(file_bytes: bytes, file_name: str, body: OCRRequest) -> Multip
     """
     temp_dir = tempfile.mkdtemp(prefix="mineru-gateway-ocr-")
 
-    # Ensure the upload has a file extension (MinerU infers the parser from it); default to .pdf.
     safe_name = file_name if "." in file_name else f"{file_name}.pdf"
-    file_path = os.path.join(temp_dir, safe_name)
+    file_path, safe_name = internal_upload_path(temp_dir, client_name=safe_name)
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 

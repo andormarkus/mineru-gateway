@@ -41,3 +41,9 @@ def moto_ec2_endpoint(aws_test_env: None) -> Iterator[str]:
     endpoint = f"http://127.0.0.1:{port}"
     yield endpoint
     server.stop()
+
+
+def create_s3_bucket(endpoint: str, bucket: str, *, region: str = "us-east-1") -> None:
+    import boto3
+
+    boto3.client("s3", endpoint_url=endpoint, region_name=region).create_bucket(Bucket=bucket)

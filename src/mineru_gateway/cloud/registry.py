@@ -1,9 +1,4 @@
-"""Cloud provider registry — compute + storage factories keyed by ``cloud.provider``.
-
-Add Azure/GCP by implementing providers under ``cloud/azure/`` or ``cloud/gcp/`` and
-registering factories below. Scheduler/autoscaler and gateway code stay provider-agnostic
-via the ABCs.
-"""
+"""Cloud provider registry — AWS compute + storage factories keyed by ``cloud.provider``."""
 
 from __future__ import annotations
 
@@ -12,28 +7,30 @@ from collections.abc import Callable
 
 from mineru_gateway.cloud.aws.ec2 import AwsEc2Provider
 from mineru_gateway.cloud.aws.s3 import S3ObjectStore
-from mineru_gateway.cloud.base import CloudStorageProvider, CloudWorkerProvider
-from mineru_gateway.config import CloudConfig, get_settings
+from mineru_gateway.cloud.base import CloudStorageProvider, ComputeProvider
+from mineru_gateway.config import GatewaySettings
 
 logger = logging.getLogger(__name__)
 
-ProviderFactory = Callable[[CloudConfig], CloudWorkerProvider]
-StoreFactory = Callable[[CloudConfig], CloudStorageProvider]
+ProviderFactory = Callable[[GatewaySettings], ComputeProvider]
+StoreFactory = Callable[[GatewaySettings], CloudStorageProvider]
 
 _COMPUTE_FACTORIES: dict[str, ProviderFactory] = {
-    "aws": lambda cloud: AwsEc2Provider(region=cloud.aws.region, endpoint_url=cloud.aws.ec2_endpoint_url),
-    # "azure": lambda cloud: AzureVmProvider(region=cloud.azure.region),
-    # "gcp": lambda cloud: GcpComputeProvider(region=cloud.gcp.region),
+    "aws": lambda settings: AwsEc2Provider(
+        region=settings.cloud.aws.region,
+        endpoint_url=settings.cloud.aws.ec2_endpoint_url,
+        cloud=settings.cloud,
+        deployment_id=settings.deployment_id,
+    )
 }
 
 _STORE_FACTORIES: dict[str, StoreFactory] = {
-    "aws": lambda cloud: S3ObjectStore(
-        bucket=cloud.aws.bucket,
-        endpoint_url=cloud.aws.endpoint_url,
-        region=cloud.aws.region,
-    ),
-    # "azure": lambda cloud: AzureBlobStore(container=cloud.azure.container, account_url=cloud.azure.account_url),
-    # "gcp": lambda cloud: GcsObjectStore(bucket=cloud.gcp.bucket),
+    "aws": lambda settings: S3ObjectStore(
+        bucket=settings.cloud.aws.bucket,
+        endpoint_url=settings.cloud.aws.endpoint_url,
+        region=settings.cloud.aws.region,
+        multipart_part_size_bytes=settings.cloud.aws.multipart_part_size_bytes,
+    )
 }
 
 
@@ -47,55 +44,43 @@ def available_store_providers() -> list[str]:
     return sorted(_STORE_FACTORIES)
 
 
-def get_provider(name: str | None = None) -> CloudWorkerProvider:
+def get_provider(name: str | None, *, settings: GatewaySettings) -> ComputeProvider:
     """Return a configured compute provider for ``name`` (defaults to config)."""
-    cloud = get_settings().cloud
-    resolved = name or cloud.provider
+    resolved = name or settings.cloud.provider
     factory = _COMPUTE_FACTORIES.get(resolved)
     if factory is None:
-        raise ValueError(
-            f"Cloud provider '{resolved}' is not implemented. Available: {available_providers()}"
-        )
-    return factory(cloud)
+        raise ValueError(f"Cloud provider '{resolved}' is not implemented. Available: {available_providers()}")
+    return factory(settings)
 
 
-def get_store(name: str | None = None) -> CloudStorageProvider:
+def get_store(name: str | None, *, settings: GatewaySettings) -> CloudStorageProvider:
     """Return a configured object store for ``name`` (defaults to config)."""
-    cloud = get_settings().cloud
-    resolved = name or cloud.provider
+    resolved = name or settings.cloud.provider
     factory = _STORE_FACTORIES.get(resolved)
     if factory is None:
         raise ValueError(
             f"Object store for provider '{resolved}' is not implemented. Available: {available_store_providers()}"
         )
-    return factory(cloud)
+    return factory(settings)
 
 
-def init_provider() -> CloudWorkerProvider | None:
-    """Build the configured compute provider, returning it (or None if it can't be built)."""
-    try:
-        provider = get_provider(get_settings().cloud.provider)
-        logger.info("Cloud compute provider initialized: %s", provider.name)
-        return provider
-    except Exception:
-        logger.warning("Cloud provider unavailable — running without cloud scaling", exc_info=True)
+def init_provider(settings: GatewaySettings) -> ComputeProvider | None:
+    """Build the configured compute provider."""
+    if not settings.cloud_workers_enabled:
         return None
+    provider = get_provider(settings.cloud.provider, settings=settings)
+    logger.info("Cloud compute provider initialized: %s", provider.name)
+    return provider
 
 
-async def init_store() -> CloudStorageProvider | None:
-    """Build + prepare the object store from settings, returning it (or None if unconfigured)."""
-    cloud = get_settings().cloud
+async def init_store(settings: GatewaySettings, *, required: bool = True) -> CloudStorageProvider | None:
+    """Build and validate the object store from settings."""
+    cloud = settings.cloud
     if not cloud.is_object_store_configured():
+        if required:
+            raise RuntimeError(f"cloud.{cloud.provider} bucket/container name is required")
         return None
-    try:
-        store = get_store(cloud.provider)
-        await store.prepare()
-        logger.info(
-            "Object store initialized: provider=%s bucket=%s",
-            cloud.provider,
-            cloud.object_store_bucket(),
-        )
-        return store
-    except Exception:
-        logger.warning("Object store unavailable — running without durable result/payload storage", exc_info=True)
-        return None
+    store = get_store(cloud.provider, settings=settings)
+    await store.prepare()
+    logger.info("Object store initialized: provider=%s bucket=%s", cloud.provider, cloud.object_store_bucket())
+    return store

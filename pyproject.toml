@@ -37,7 +37,6 @@ dependencies = [
 [project.optional-dependencies]
 # Drivers for non-sqlite backends. Installed only when needed.
 postgres = ["asyncpg>=0.29"]
-mysql = ["asyncmy>=0.2.9"]
 # OpenTelemetry instrumentation (Phase 9). Install with: uv sync --extra otel
 otel = [
     "opentelemetry-distro>=0.48",
@@ -67,7 +66,7 @@ integration = [
 [project.scripts]
 # `mineru-gateway` launches the API gateway (click CLI → uvicorn). See src/mineru_gateway/gateway/main.py.
 mineru-gateway = "mineru_gateway.gateway.main:main"
-# `mineru-scheduler` launches the scheduler process (background loops, active-passive).
+# `mineru-scheduler` launches the single scheduler process (one sequential tick loop).
 mineru-scheduler = "mineru_gateway.scheduler.main:main"
 
 # --- Hatchling build config (src layout) --------------------------------------
@@ -147,6 +146,7 @@ asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
 markers = [
     "integration: tests requiring Docker (testcontainers / SeaweedFS)",
+    "postgres: tests requiring PostgreSQL (testcontainers or MINERU_GATEWAY_TEST_POSTGRES_URL)",
     "slow: tests requiring a real mineru-api worker (Tier-3, end-to-end)",
 ]
 filterwarnings = [

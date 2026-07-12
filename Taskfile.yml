@@ -1,0 +1,126 @@
+version: "3"
+
+# Task runner for mineru-gateway.
+# Tools: uv (~/.local/bin/uv), task (/opt/homebrew/bin/task).
+# All commands run through `uv` so the Python version + deps are managed by uv.
+
+dotenv: [".env"]
+
+vars:
+  PACKAGE: mineru_gateway
+  # Default to in-memory-friendly sqlite for dev; override via env or config.yaml.
+  DATABASE_URL: sqlite+aiosqlite:///./gateway.db
+
+tasks:
+  # ---------------------------------------------------------------- install ---
+  install:
+    desc: Create the uv venv (Python 3.13) and install all deps (runtime + dev + test).
+    cmds:
+      # --all-extras pulls dev, test, postgres, integration groups.
+      - uv sync --all-extras
+
+  install-runtime:
+    desc: Install only runtime deps (no dev/test). For CI / production images.
+    cmds:
+      - uv sync --no-dev
+
+  # ------------------------------------------------------------------- lint ---
+  lint:
+    desc: Run ruff check (--fix) then format.
+    cmds:
+      - uv run ruff check --fix src tests
+      - uv run ruff format src tests
+
+  lint-check:
+    desc: Lint without modifying files (CI gate).
+    cmds:
+      - uv run ruff check src tests
+      - uv run ruff format --check src tests
+
+  # ------------------------------------------------------------ typecheck ---
+  typecheck:
+    desc: Run pyright (strict-ish) over src + tests.
+    cmds:
+      - uv run pyright
+
+  # ------------------------------------------------------------------ test ---
+  test:
+    desc: Run unit tests (no Docker). Excludes integration + slow marks.
+    cmds:
+      - uv run pytest tests/unit -m "not integration and not slow"
+
+  test-integration:
+    desc: Run integration tests (Docker required, testcontainers + SeaweedFS).
+    cmds:
+      - uv run pytest tests/integration -m "integration"
+
+  test-all:
+    desc: Run the full suite (unit + integration), excluding slow real-model tests.
+    cmds:
+      - uv run pytest tests -m "not slow"
+
+  test-postgres:
+    desc: Run PostgreSQL tests (testcontainers or MINERU_GATEWAY_TEST_POSTGRES_URL).
+    cmds:
+      - uv run pytest tests -m postgres
+
+  # --------------------------------------------------------------- migrate ---
+  migrate:
+    desc: Apply Alembic migrations to head (db upgrade). Uses DATABASE_URL.
+    aliases: [db-upgrade]
+    env:
+      DATABASE_URL: "{{.DATABASE_URL}}"
+    cmds:
+      - uv run alembic upgrade head
+
+  migrate-new:
+    desc: Create a new empty Alembic migration. Usage - task migrate-new -- -m "msg"
+    cmds:
+      - uv run alembic revision --autogenerate -m "{{.CLI_ARGS}}"
+
+  # ------------------------------------------------------------------- run ---
+  run:
+    desc: Run the gateway dev server (uvicorn, reload).
+    env:
+      DATABASE_URL: "{{.DATABASE_URL}}"
+    cmds:
+      - uv run uvicorn mineru_gateway.gateway.app:create_app --factory --reload --host 127.0.0.1 --port 8000
+
+  run-cli:
+    desc: Run via the click CLI (mineru-gateway --help).
+    cmds:
+      - uv run mineru-gateway {{.CLI_ARGS}}
+
+  # ----------------------------------------------------------- docker dev ---
+  up:
+    desc: Start local dev deps via docker-compose (SeaweedFS S3 + Postgres).
+    cmds:
+      - docker compose -f docker-compose.dev.yml up -d
+
+  down:
+    desc: Stop local dev deps.
+    cmds:
+      - docker compose -f docker-compose.dev.yml down -v
+
+  # --------------------------------------------------------------- build ----
+  build:
+    desc: Build the production Docker image.
+    cmds:
+      - docker build -t mineru-gateway:latest .
+
+  # -------------------------------------------------------------- checks ----
+  checks:
+    desc: Run lint + typecheck + unit tests + PostgreSQL tests (the pre-commit combo).
+    cmds:
+      - task: lint-check
+      - task: typecheck
+      - task: test
+      - task: test-postgres
+
+  checks-full:
+    desc: Run lint + typecheck + unit, integration, and PostgreSQL tests.
+    cmds:
+      - task: lint-check
+      - task: typecheck
+      - task: test-all
+      - task: test-postgres

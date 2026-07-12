@@ -1,0 +1,95 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- uv ---
+# uv.lock IS committed (reproducible installs). .venv is ignored above.
+# Uncomment to ignore lockfile if you prefer not to pin transitive deps:
+# uv.lock
+
+# --- Type-check / lint caches ---
+.pytype/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pyright/
+.ruff_cache/
+.ruff_cache/
+
+# --- Test / coverage ---
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+cov_html/
+
+# --- Project secrets / local config ---
+# config.yaml holds secrets (DB passwords, S3 keys, AWS creds) — never commit.
+config.yaml
+config.*.yaml
+!config.example.yaml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Local SQLite DBs ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Docker ---
+# Local override files for compose, if any.
+docker-compose.override.yml
+
+# --- Operating system ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

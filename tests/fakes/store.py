@@ -51,6 +51,11 @@ class InMemoryStore(CloudStorageProvider):
     async def delete(self, key: str) -> bool:
         return self._data.pop(key, None) is not None
 
+    async def copy(self, source: str, destination: str) -> None:
+        if source not in self._data:
+            raise KeyError(source)
+        self._data[destination] = self._data[source]
+
     async def head(self, key: str) -> dict[str, object]:
         if key not in self._data:
             raise KeyError(key)

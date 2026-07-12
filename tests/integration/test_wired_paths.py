@@ -33,6 +33,15 @@ from mineru_gateway.cloud.aws.s3 import S3ObjectStore
 pytestmark = pytest.mark.integration
 
 
+async def _create_moto_bucket(endpoint: str, bucket: str) -> None:
+    """Create bucket in moto for test setup (app never auto-creates buckets)."""
+    import aioboto3
+
+    session = aioboto3.Session()
+    async with session.client("s3", endpoint_url=endpoint) as s3:  # pyright: ignore[reportGeneralTypeIssues]
+        await s3.create_bucket(Bucket=bucket)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures: moto S3 server + gateway app with real S3 + FakeWorker
 # ---------------------------------------------------------------------------
@@ -60,7 +69,8 @@ async def s3_store(moto_s3_endpoint: str, monkeypatch: pytest.MonkeyPatch) -> As
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
 
     store = S3ObjectStore(bucket="gateway-test", endpoint_url=moto_s3_endpoint, region="us-east-1")
-    await store.ensure_bucket()
+    await _create_moto_bucket(moto_s3_endpoint, "gateway-test")
+    await store.prepare()
     yield store  # type: ignore[misc]
 
 
@@ -91,43 +101,57 @@ async def app_with_store_and_worker(
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("MINERU_GATEWAY_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
+    from unittest.mock import AsyncMock, patch
+
+    from mineru_gateway.config import load_settings, reset_settings_cache
+
+    reset_settings_cache()
+    load_settings()
 
     # --- Build the real S3ObjectStore ---
     store = S3ObjectStore(bucket="gateway-dispatch-test", endpoint_url=moto_s3_endpoint, region="us-east-1")
-    await store.ensure_bucket()
+    await _create_moto_bucket(moto_s3_endpoint, "gateway-dispatch-test")
+    await store.prepare()
 
     try:
-        # --- Boot gateway with S3 wired ---
         from mineru_gateway.db.base import init_engine, shutdown_engine
         from mineru_gateway.gateway.app import create_app
 
+        await shutdown_engine()
         init_engine("sqlite+aiosqlite:///:memory:")
         from tests.db_helpers import create_all_tables
 
         await create_all_tables()
-        application = create_app()
-        async with application.router.lifespan_context(application):
-            # Inject the real store.
-            application.state.object_store = store
+        with patch("mineru_gateway.gateway.app.init_store", new=AsyncMock(return_value=store)):
+            application = create_app()
+            async with application.router.lifespan_context(application):
+                # Register the FakeWorker directly in the DB (no in-memory pool anymore).
+                worker_id = "fake-1"
+                worker_url = f"http://127.0.0.1:{worker_port}"
+                from mineru_gateway.config import get_settings
+                from mineru_gateway.db.base import get_db_session
+                from mineru_gateway.db.models import Worker
 
-            # Register the FakeWorker directly in the DB (no in-memory pool anymore).
-            worker_id = "fake-1"
-            worker_url = f"http://127.0.0.1:{worker_port}"
-            from mineru_gateway.db.base import get_db_session
-            from mineru_gateway.db.models import Worker
-            from mineru_gateway.workers.crud import register_worker as register_worker_db
-
-            await register_worker_db(worker_id=worker_id, base_url=worker_url, source="static")
-            async with get_db_session() as session:
-                row = await session.get(Worker, worker_id)
-                if row is not None:
-                    row.healthy = True
-                    row.state = "running"
+                settings = get_settings()
+                async with get_db_session() as session:
+                    session.add(
+                        Worker(
+                            id=worker_id,
+                            provider=settings.cloud.provider,
+                            deployment_id=settings.deployment_id,
+                            base_url=worker_url,
+                            desired_state="running",
+                            cloud_state="running",
+                            healthy=True,
+                        )
+                    )
                     await session.commit()
 
-            transport = ASGITransport(app=application)
-            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-                yield client, fake_state, worker_id, store
+                transport = ASGITransport(app=application)
+                async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                    yield client, fake_state, worker_id, store
 
         await shutdown_engine()
     finally:
@@ -184,25 +208,80 @@ async def test_real_s3_missing_keyerror(s3_store: S3ObjectStore) -> None:
 async def test_dedup_cache_miss_then_hit(
     app_with_store_and_worker: tuple[AsyncClient, object, str, S3ObjectStore],
 ) -> None:
-    """Submit the same file twice → second request hits the cache."""
-    client, _worker_state, _, _ = app_with_store_and_worker
+    """Submit the same file twice → second request hits the populated cache object."""
+    import httpx
+
+    from mineru_gateway.config import get_settings
+    from mineru_gateway.db.base import get_db_session
+    from mineru_gateway.db.models import CacheEntry, Task
+    from mineru_gateway.scheduler.cache_service import compute_cache_key, compute_file_records
+    from mineru_gateway.scheduler.scheduler import Scheduler
+    from mineru_gateway.scheduler.task_repository import TaskRepository
+    from mineru_gateway.scheduler.worker_repository import WorkerRepository
+    from mineru_gateway.tasks.storage import cache_object_key
+
+    client, _worker_state, _, store = app_with_store_and_worker
+    settings = get_settings()
 
     file_content = b"%PDF-1.4 identical content for dedup"
     form_data = {"backend": "pipeline", "effort": "medium", "parse_method": "auto"}
+    file_records = compute_file_records(["doc.pdf"], [file_content])
+    cache_key, _ = compute_cache_key(file_records, {"backend": "pipeline", "effort": "medium", "parse_method": "auto"})
 
-    # First submit — cache miss (dispatches to worker).
-    resp1 = await client.post("/tasks", files=[("files", ("doc.pdf", file_content, "application/pdf"))], data=form_data)
-    assert resp1.status_code == 202
-    task1 = resp1.json()
+    stop = asyncio.Event()
 
-    # Second submit with same content + options — cache hit.
-    resp2 = await client.post("/tasks", files=[("files", ("doc.pdf", file_content, "application/pdf"))], data=form_data)
-    assert resp2.status_code == 202
-    task2 = resp2.json()
+    async def run_scheduler_ticks() -> None:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            workers = WorkerRepository(settings)
+            task_repo = TaskRepository(settings, store, http_client, workers)
+            scheduler = Scheduler(settings=settings, store=store, client=http_client, provider=None)
+            while not stop.is_set():
+                await task_repo.dispatch_queued_tasks()
+                await scheduler._synchronize_tasks_and_results()
+                await asyncio.sleep(0.05)
 
-    # The second task should be a different task_id but may show cache-hit
-    # characteristics. At minimum both should succeed.
-    assert task1["task_id"] != task2["task_id"]
+    scheduler_task = asyncio.create_task(run_scheduler_ticks())
+    try:
+        resp1 = await client.post(
+            "/tasks", files=[("files", ("doc.pdf", file_content, "application/pdf"))], data=form_data
+        )
+        assert resp1.status_code == 202
+        task1_id = resp1.json()["task_id"]
+
+        for _ in range(60):
+            async with get_db_session() as session:
+                row = await session.get(Task, task1_id)
+            if row is not None and row.status == "completed" and row.result_key:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("first task did not complete with stored result")
+
+        async with get_db_session() as session:
+            cache_row = await session.get(CacheEntry, cache_key)
+        assert cache_row is not None
+        expected_object_key = cache_row.object_key
+        assert expected_object_key
+        assert expected_object_key.startswith(cache_object_key(cache_key))
+        assert await store.exists(expected_object_key), f"cache object missing at {expected_object_key}"
+
+        resp2 = await client.post(
+            "/tasks", files=[("files", ("doc.pdf", file_content, "application/pdf"))], data=form_data
+        )
+        assert resp2.status_code == 202
+        task2 = resp2.json()
+        assert task2["status"] == "completed"
+        assert task2["task_id"] != task1_id
+
+        async with get_db_session() as session:
+            cache_row = await session.get(CacheEntry, cache_key)
+        assert cache_row is not None
+        assert cache_row.object_key == expected_object_key
+    finally:
+        stop.set()
+        scheduler_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler_task
 
 
 @pytest.mark.asyncio
@@ -233,7 +312,7 @@ async def test_result_durability_through_dispatch(
     app_with_store_and_worker: tuple[AsyncClient, object, str, S3ObjectStore],
 ) -> None:
     """A submitted task's result gets stored to S3 and can be retrieved."""
-    client, _worker_state, _, _store = app_with_store_and_worker
+    client, _worker_state, _, store = app_with_store_and_worker
 
     resp = await client.post(
         "/tasks",
@@ -243,24 +322,34 @@ async def test_result_durability_through_dispatch(
     assert resp.status_code == 202
     task_id = resp.json()["task_id"]
 
-    # Poll until completed (the status endpoint also stores the result to S3
-    # opportunistically when it sees status=completed).
-    body: dict = {}
-    for _ in range(30):
-        status = await client.get(f"/tasks/{task_id}")
-        body = status.json()
-        if body["status"] in ("completed", "failed"):
-            break
-        await asyncio.sleep(0.2)
+    import httpx
+
+    from mineru_gateway.config import get_settings
+    from mineru_gateway.scheduler.scheduler import Scheduler
+    from mineru_gateway.scheduler.task_repository import TaskRepository
+    from mineru_gateway.scheduler.worker_repository import WorkerRepository
+
+    settings = get_settings()
+    workers = WorkerRepository(settings)
+    async with httpx.AsyncClient(timeout=30.0) as http_client:
+        task_repo = TaskRepository(settings, store, http_client, workers)
+        scheduler = Scheduler(settings=settings, store=store, client=http_client, provider=None)
+
+        body: dict = {}
+        for _ in range(30):
+            await task_repo.dispatch_queued_tasks()
+            await scheduler._synchronize_tasks_and_results()
+            status = await client.get(f"/tasks/{task_id}")
+            body = status.json()
+            if body["status"] in ("completed", "failed"):
+                break
+            await asyncio.sleep(0.2)
 
     assert body["status"] == "completed", f"Task didn't complete: {body}"
 
-    # The result should be retrievable — either from S3 (durable pointer) or
-    # proxied from the worker. Either path is a valid result retrieval.
     result_resp = await client.get(f"/tasks/{task_id}/result")
-    assert result_resp.status_code in (200, 202, 502), f"Unexpected: {result_resp.status_code}"
-    if result_resp.status_code == 200:
-        assert len(result_resp.content) > 0
+    assert result_resp.status_code == 200, f"Result not retrievable: {result_resp.status_code}"
+    assert len(result_resp.content) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -269,13 +358,51 @@ async def test_result_durability_through_dispatch(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skip(
-    reason="Needs an in-fixture scheduler dispatch harness now that /v1/ocr goes through the "
-    "central queue (not inline dispatch). The unit tests cover ingest + dispatch + health "
-    "monitor individually; this end-to-end test requires a shared moto-S3 context across the "
-    "dispatch client and the gateway, which the current fixture doesn't provide."
-)
 async def test_v1_ocr_with_base64_document(
     app_with_store_and_worker: tuple[AsyncClient, object, str, S3ObjectStore],
 ) -> None:
     """/v1/ocr accepts a base64-encoded document, ingests to the queue, and returns normalized pages."""
+    import base64
+
+    import httpx
+
+    from mineru_gateway.config import get_settings
+    from mineru_gateway.scheduler.scheduler import Scheduler
+    from mineru_gateway.scheduler.task_repository import TaskRepository
+    from mineru_gateway.scheduler.worker_repository import WorkerRepository
+
+    client, _, _, store = app_with_store_and_worker
+    settings = get_settings()
+    stop = asyncio.Event()
+
+    async def run_scheduler_ticks() -> None:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            workers = WorkerRepository(settings)
+            task_repo = TaskRepository(settings, store, http_client, workers)
+            scheduler = Scheduler(settings=settings, store=store, client=http_client, provider=None)
+            while not stop.is_set():
+                await task_repo.dispatch_queued_tasks()
+                await scheduler._synchronize_tasks_and_results()
+                await asyncio.sleep(0.05)
+
+    scheduler_task = asyncio.create_task(run_scheduler_ticks())
+    try:
+        pdf_bytes = b"%PDF-1.4 ocr integration test"
+        resp = await client.post(
+            "/v1/ocr",
+            json={
+                "model": "mineru",
+                "document": {"type": "file", "file": base64.b64encode(pdf_bytes).decode(), "file_name": "ocr.pdf"},
+                "backend": "pipeline",
+            },
+            timeout=60.0,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["model"] == "mineru"
+        assert isinstance(body["pages"], list)
+    finally:
+        stop.set()
+        scheduler_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler_task

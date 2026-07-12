@@ -9,27 +9,57 @@
 # Config is read ONCE at startup; changes require a restart (cheap — state
 # lives in the DB).
 
-# Database (async SQLAlchemy). Scheme picks the driver:
-#   sqlite+aiosqlite:///./gateway.db        (dev/test default)
-#   postgresql+asyncpg://user:pass@host/db  (prod; install [postgres] extra)
-#   mysql+asyncmy://user:pass@host/db       (install [mysql] extra)
+# Database (async SQLAlchemy):
+#   sqlite+aiosqlite:///./gateway.db        (dev/test only)
+#   postgresql+asyncpg://user:pass@host/db  (production; install [postgres] extra)
 database_url: sqlite+aiosqlite:///./gateway.db
 
 # Server bind.
 host: "127.0.0.1"
 port: 8000
 
+# Unique deployment identity — tags cloud VMs and scopes reconciliation.
+deployment_id: "dev-local"
+
 # Process log level (DEBUG | INFO | WARNING | ERROR).
 log_level: "INFO"
 
+# Max upload size in bytes (0 = unlimited). Enforced during gateway staging and OCR extraction.
+# Configure the reverse proxy or ingress with the same or smaller request-body limit so multipart
+# parsing cannot spool unbounded data before these checks run.
+max_file_size_bytes: 0
+
 scaling:
-  # Target-tracking on queue depth: signal = (pending+processing tasks) / healthy workers.
+  # Target-tracking on queued/dispatching/processing tasks per serviceable worker.
   target_per_worker: 4
   min_workers: 0
   max_workers: 12
   idle_cooldown_seconds: 300      # stop a worker idle longer than this
   scale_up_cooldown_seconds: 60   # prevent thrash between scale-ups
-  poll_interval_seconds: 10       # background loop cadence
+
+# Internal API key (required for non-probe endpoints in production).
+auth:
+  enabled: false
+  api_key: null
+
+scheduler:
+  # Single scheduler process; PostgreSQL advisory lock prevents overlap in prod.
+  # Run replicas: 1 (K8s Recreate strategy) or ECS desired count 1.
+  poll_interval_seconds: 10
+
+reconciliation:
+  launch_readiness_timeout_seconds: 1800
+  max_failure_count: 8
+  stalled_worker_grace_seconds: 900
+
+rotation:
+  interval_seconds: 604800
+  readiness_timeout_seconds: 1800
+
+retention:
+  # Scheduler deletes expired task payloads/results and cache objects.
+  retention_days: 30
+  cleanup_interval_seconds: 3600  # hourly
 
 cache:
   enabled: true
@@ -39,7 +69,6 @@ cache:
   sweeper_interval_seconds: 600
 
 cloud:
-  # Cloud worker provider: aws | azure | gcp (azure/gcp require provider implementation).
   provider: "aws"
   aws:
     region: "us-east-1"
@@ -50,18 +79,6 @@ cloud:
     ec2_endpoint_url: null
     launch_template_id: null
     launch_template_version: "$Default"
-    subnet_id: null
-    security_group_id: null
-  azure:
-    region: "eastus"
-    container: "mineru-results"
-    launch_template_id: null
-    launch_template_version: null
-  gcp:
-    region: "us-central1"
-    bucket: "mineru-results"
-    launch_template_id: null
-    launch_template_version: null
 
 attribution:
   # MinerU LICENSE §2: online services built on MinerU must clearly indicate

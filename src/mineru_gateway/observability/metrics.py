@@ -25,24 +25,12 @@ class Metrics:
         self._tasks_sla_expired: Any = None
         self._results_stored: Any = None
         self._results_store_failed: Any = None
-        self._scaling_events: Any = None
-        self._cache_sweep_removed: Any = None
         self._workers_health_checks: Any = None
         self._tasks_poll_duration: Any = None
         self._tasks_dispatch_duration: Any = None
-        self._queue_depth: Any = None
-        self._workers_running: Any = None
-        self._workers_healthy: Any = None
-        self._scaling_signal: Any = None
-        self._scheduler_is_leader: Any = None
+        self._retention_deleted: Any = None
 
-    def init_metrics(
-        self,
-        *,
-        service_name: str,
-        endpoint: str,
-        export_interval_seconds: int = 60,
-    ) -> None:
+    def init_metrics(self, *, service_name: str, endpoint: str, export_interval_seconds: int = 60) -> None:
         """Wire OTLP metric export. Called once at process startup."""
         try:
             from opentelemetry import metrics as otel_metrics
@@ -53,8 +41,7 @@ class Metrics:
 
             resource = Resource.create({"service.name": service_name})
             reader = PeriodicExportingMetricReader(
-                OTLPMetricExporter(endpoint=endpoint),
-                export_interval_millis=export_interval_seconds * 1000,
+                OTLPMetricExporter(endpoint=endpoint), export_interval_millis=export_interval_seconds * 1000
             )
             provider = MeterProvider(resource=resource, metric_readers=[reader])
             otel_metrics.set_meter_provider(provider)
@@ -64,8 +51,7 @@ class Metrics:
             logger.info("OTel metrics enabled: service=%s endpoint=%s", service_name, endpoint)
         except ImportError:
             logger.warning(
-                "OTel metrics enabled but opentelemetry packages not installed. Install with: "
-                "uv sync --extra otel"
+                "OTel metrics enabled but opentelemetry packages not installed. Install with: uv sync --extra otel"
             )
 
     def _create_instruments(self) -> None:
@@ -89,46 +75,23 @@ class Metrics:
         self._results_store_failed = meter.create_counter(
             "mineru.results.store_failed", description="Failed result store attempts"
         )
-        self._scaling_events = meter.create_counter(
-            "mineru.scaling.events", description="Autoscaler scaling actions"
-        )
-        self._cache_sweep_removed = meter.create_counter(
-            "mineru.cache.sweep_removed", description="Expired cache entries removed"
-        )
         self._workers_health_checks = meter.create_counter(
             "mineru.workers.health_checks", description="Worker health check outcomes"
         )
         self._tasks_poll_duration = meter.create_histogram(
-            "mineru.tasks.poll.duration",
-            unit="ms",
-            description="Sync route poll-until-terminal duration",
+            "mineru.tasks.poll.duration", unit="ms", description="Sync route poll-until-terminal duration"
         )
         self._tasks_dispatch_duration = meter.create_histogram(
-            "mineru.tasks.dispatch.duration",
-            unit="ms",
-            description="Single task dispatch duration",
+            "mineru.tasks.dispatch.duration", unit="ms", description="Single task dispatch duration"
         )
-        self._queue_depth = meter.create_gauge("mineru.queue.depth", description="Pending + processing tasks")
-        self._workers_running = meter.create_gauge(
-            "mineru.workers.running", description="Healthy running workers"
-        )
-        self._workers_healthy = meter.create_gauge(
-            "mineru.workers.healthy", description="Workers passing last health check"
-        )
-        self._scaling_signal = meter.create_gauge(
-            "mineru.scaling.signal", description="Queue depth per running worker"
-        )
-        self._scheduler_is_leader = meter.create_gauge(
-            "mineru.scheduler.is_leader", description="1 if this scheduler holds leadership"
+        self._retention_deleted = meter.create_counter(
+            "mineru.retention.deleted", description="Objects/rows deleted by retention cleanup"
         )
 
     def record_task_ingested(self, *, source: str, cache_hit: bool, backend: str) -> None:
         if not self._enabled:
             return
-        self._tasks_ingested.add(
-            1,
-            {"source": source, "cache_hit": str(cache_hit).lower(), "backend": backend},
-        )
+        self._tasks_ingested.add(1, {"source": source, "cache_hit": str(cache_hit).lower(), "backend": backend})
 
     def record_admission_rejected(self, *, reason: str) -> None:
         if not self._enabled:
@@ -165,16 +128,6 @@ class Metrics:
             return
         self._results_store_failed.add(count)
 
-    def record_scaling_event(self, *, action: str, tier: str) -> None:
-        if not self._enabled:
-            return
-        self._scaling_events.add(1, {"action": action, "tier": tier})
-
-    def record_cache_sweep_removed(self, count: int) -> None:
-        if not self._enabled or count <= 0:
-            return
-        self._cache_sweep_removed.add(count)
-
     def record_health_check(self, *, outcome: str) -> None:
         if not self._enabled:
             return
@@ -185,30 +138,10 @@ class Metrics:
             return
         self._tasks_poll_duration.record(duration_ms, {"route": route, "outcome": outcome})
 
-    def set_queue_depth(self, value: int) -> None:
-        if not self._enabled:
+    def record_retention_deleted(self, *, kind: str, count: int = 1) -> None:
+        if not self._enabled or count <= 0:
             return
-        self._queue_depth.set(value)
-
-    def set_workers_running(self, value: int) -> None:
-        if not self._enabled:
-            return
-        self._workers_running.set(value)
-
-    def set_workers_healthy(self, value: int) -> None:
-        if not self._enabled:
-            return
-        self._workers_healthy.set(value)
-
-    def set_scaling_signal(self, value: float) -> None:
-        if not self._enabled:
-            return
-        self._scaling_signal.set(value)
-
-    def set_scheduler_leadership(self, *, is_leader: bool, hostname: str) -> None:
-        if not self._enabled:
-            return
-        self._scheduler_is_leader.set(1 if is_leader else 0, {"hostname": hostname})
+        self._retention_deleted.add(count, {"kind": kind})
 
 
 metrics = Metrics()

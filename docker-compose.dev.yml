@@ -1,0 +1,46 @@
+# Local dev dependencies for mineru-gateway.
+#
+# Usage:
+#   task up      # start SeaweedFS (S3) + Postgres
+#   task down    # stop and remove volumes
+#
+# The gateway itself runs on the host via `task run`, talking to these services.
+
+services:
+  # SeaweedFS in "mini" mode — a single-node S3-compatible store. Perfect for
+  # integration tests of storage/s3.py without real AWS.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.86
+    command: "server -s3 -s3.config=/etc/seaweedfs/s3.json"
+    ports:
+      - "8333:8333"   # S3 API
+      - "9333:9333"   # master
+      - "19333:19333" # volume admin
+    volumes:
+      - seaweed_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8333/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  seaweed_data:
+  pg_data:
