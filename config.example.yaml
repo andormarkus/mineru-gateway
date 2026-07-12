@@ -1,0 +1,81 @@
+# mineru-gateway example configuration.
+#
+# Copy to config.yaml and edit. config.yaml is gitignored (it holds secrets).
+#
+# Precedence (low → high): defaults below → config.yaml → env
+# (MINERU_GATEWAY_* with __ nesting, e.g. MINERU_GATEWAY_SCALING__MAX_WORKERS=12)
+# → CLI flags.
+#
+# Config is read ONCE at startup; changes require a restart (cheap — state
+# lives in the DB).
+
+# Database (async SQLAlchemy). Scheme picks the driver:
+#   sqlite+aiosqlite:///./gateway.db        (dev/test default)
+#   postgresql+asyncpg://user:pass@host/db  (prod; install [postgres] extra)
+#   mysql+asyncmy://user:pass@host/db       (install [mysql] extra)
+database_url: sqlite+aiosqlite:///./gateway.db
+
+# Server bind.
+host: "127.0.0.1"
+port: 8000
+
+# Process log level (DEBUG | INFO | WARNING | ERROR).
+log_level: "INFO"
+
+scaling:
+  # Target-tracking on queue depth: signal = (pending+processing tasks) / healthy workers.
+  target_per_worker: 4
+  min_workers: 0
+  max_workers: 12
+  idle_cooldown_seconds: 300      # stop a worker idle longer than this
+  scale_up_cooldown_seconds: 60   # prevent thrash between scale-ups
+  poll_interval_seconds: 10       # background loop cadence
+
+cache:
+  enabled: true
+  ttl_seconds: 604800             # 7 days
+  # Bypass on Cache-Control: no-cache header or force=true form flag.
+  # TTL sweeper drops expired content_cache rows in the background.
+  sweeper_interval_seconds: 600
+
+cloud:
+  # Cloud worker provider: aws | azure | gcp (azure/gcp require provider implementation).
+  provider: "aws"
+  aws:
+    region: "us-east-1"
+    bucket: "mineru-results"
+    # S3: SeaweedFS mini mode for dev/test; omit endpoint_url for AWS S3 in prod.
+    endpoint_url: "http://localhost:8333"
+    # EC2: moto/local only; omit ec2_endpoint_url for AWS EC2 in prod.
+    ec2_endpoint_url: null
+    launch_template_id: null
+    launch_template_version: "$Default"
+    subnet_id: null
+    security_group_id: null
+  azure:
+    region: "eastus"
+    container: "mineru-results"
+    launch_template_id: null
+    launch_template_version: null
+  gcp:
+    region: "us-central1"
+    bucket: "mineru-results"
+    launch_template_id: null
+    launch_template_version: null
+
+attribution:
+  # MinerU LICENSE §2: online services built on MinerU must clearly indicate
+  # MinerU is used. This is a license obligation, on by default — all three.
+  enabled: true
+  # Middleware sets these on every response.
+  powered_by_header: "MinerU"
+  version_header: "MinerU-Version"
+
+otel:
+  # OpenTelemetry traces + metrics via OTLP HTTP. Off by default.
+  # Install the otel extra: uv sync --extra otel
+  enabled: false
+  endpoint: "http://localhost:4318"
+  service_name: "mineru-gateway"
+  scheduler_service_name: "mineru-scheduler"
+  metrics_export_interval_seconds: 60
