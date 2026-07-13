@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -49,8 +50,6 @@ def internal_upload_path(temp_dir: str, *, client_name: str) -> tuple[str, str]:
 
 def rewrite_staged_uploads(payload: MultipartPayload) -> None:
     """Rewrite staged uploads to internal paths under the payload temp directory."""
-    import shutil
-
     from mineru_gateway.mineru_compat import StagedUpload
 
     temp_dir = payload.temp_dir

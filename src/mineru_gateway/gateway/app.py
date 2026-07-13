@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -97,7 +98,7 @@ def _register_routes(app: FastAPI) -> None:
     app.include_router(admin_router)
 
     @app.get("/health", tags=["meta"])
-    async def health() -> dict[str, object]:
+    async def health() -> dict[str, Any]:
         """Liveness — process is running."""
         return {"status": "ok", "version": __version__, "upstream": upstream_info()}
 
@@ -110,7 +111,7 @@ def _register_routes(app: FastAPI) -> None:
         return JSONResponse(status_code=503, content={"status": "not_ready", "detail": detail})
 
     @app.get("/", tags=["meta"])
-    async def root() -> dict[str, object]:
+    async def root() -> dict[str, Any]:
         """Attribution page (MinerU §2 obligation)."""
         return {
             "service": "mineru-gateway",

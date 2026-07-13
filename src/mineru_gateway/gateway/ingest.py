@@ -35,6 +35,7 @@ from mineru_gateway.mineru_compat import (
 )
 from mineru_gateway.observability.metrics import metrics
 from mineru_gateway.protocol.ocr_models import OCRRequest
+from mineru_gateway.scheduler._http import DOCUMENT_DOWNLOAD_TIMEOUT
 from mineru_gateway.scheduler.cache_service import (
     CacheService,
     build_cache_options_from_payload,
@@ -42,7 +43,10 @@ from mineru_gateway.scheduler.cache_service import (
     content_sha256_from_records,
 )
 from mineru_gateway.scheduler.task_repository import TaskRepository
+from mineru_gateway.tasks.status import TASK_COMPLETED, TASK_QUEUED
 from mineru_gateway.tasks.storage import payload_key as object_payload_key
+from mineru_gateway.tasks.storage import safe_delete, task_result_url, task_status_url
+from mineru_gateway.util.io import READ_CHUNK_SIZE, iter_bounded_file
 from mineru_gateway.util.upload_paths import UnsafeUploadNameError, internal_upload_path, rewrite_staged_uploads
 
 logger = logging.getLogger(__name__)
@@ -50,7 +54,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BACKEND = "hybrid-engine"
 _DEFAULT_PARSE_METHOD = "auto"
 _DEFAULT_EFFORT = "medium"
-_READ_CHUNK_SIZE = 1 << 20
 
 
 # ---------------------------------------------------------------------------
@@ -134,47 +137,117 @@ async def ingest_payload(
     file_records, options = _hash_staged_payload(payload, settings=resolved_settings)
     backend = options.get("backend", _DEFAULT_BACKEND)
     parse_method = options.get("parse_method", _DEFAULT_PARSE_METHOD)
-    cache_cfg = resolved_settings.cache
+
     cache = cache_service
-    if cache is None and store is not None and cache_cfg.enabled:
+    if cache is None and store is not None and resolved_settings.cache.enabled:
         cache = CacheService(resolved_settings, store)
-    task_repo = TaskRepository.for_gateway(resolved_settings)
 
-    cache_key: str | None = None
-    options_hash: str | None = None
-    content_sha256: str | None = None
-
-    if not skip_cache and cache_cfg.enabled and cache is not None:
-        cache_key, options_hash = cache.compute_cache_key(file_records, options)
-        content_sha256 = content_sha256_from_records(file_records)
-        cache_entry = await cache.lookup(cache_key)
-        if cache_entry is not None and cache_entry.object_key:
-            logger.info("Dedup cache hit for cache_key=%s… (source=%s)", cache_key[:12], source)
-            result = await _build_cache_hit_result(
-                cache=cache_entry, file_names=file_names, store=store, cache_service=cache
-            )
-            metrics.record_task_ingested(source=source, cache_hit=True, backend=backend)
-            return result
-
-        if cache_key is not None:
-            try:
-                await cache.create_placeholder(
-                    cache_key=cache_key,
-                    content_sha256=content_sha256,
-                    options_hash=options_hash,
-                    backend=backend,
-                    parse_method=parse_method,
-                    effort=options.get("effort", _DEFAULT_EFFORT),
-                    ttl_seconds=cache_cfg.ttl_seconds,
-                )
-            except Exception:
-                logger.exception("Cache placeholder failed for %s — continuing without cache", cache_key[:12])
-                cache_key = None
+    cache_key, cache_hit = await _resolve_cache(
+        cache=cache,
+        file_records=file_records,
+        file_names=file_names,
+        options=options,
+        backend=backend,
+        parse_method=parse_method,
+        skip_cache=skip_cache,
+        store=store,
+        source=source,
+        settings=resolved_settings,
+    )
+    if cache_hit is not None:
+        return cache_hit
 
     task_id = str(uuid.uuid4())
+    await _create_task_with_payload(
+        task_id=task_id,
+        payload=payload,
+        file_names=file_names,
+        backend=backend,
+        parse_method=parse_method,
+        options=options,
+        cache_key=cache_key,
+        store=store,
+        source=source,
+        settings=resolved_settings,
+    )
+
+    metrics.record_task_ingested(source=source, cache_hit=False, backend=backend)
+    return IngestResult(
+        task_id=task_id, cache_hit=False, status=TASK_QUEUED, response=_pending_response(task_id=task_id, source=source)
+    )
+
+
+async def _resolve_cache(
+    *,
+    cache: CacheService | None,
+    file_records: list[tuple[str, str]],
+    file_names: list[str],
+    options: dict[str, Any],
+    backend: str,
+    parse_method: str,
+    skip_cache: bool,
+    store: CloudStorageProvider | None,
+    source: str,
+    settings: GatewaySettings,
+) -> tuple[str | None, IngestResult | None]:
+    """Look up the dedup cache; return ``(cache_key_for_task, cache_hit_result)``.
+
+    On a hit, returns ``(cache_key, IngestResult)`` and the caller returns immediately.
+    On a miss (or disabled/skipped cache), returns ``(cache_key_or_None, None)`` after creating
+    a placeholder so the eventual result can populate the cache.
+    """
+    cache_cfg = settings.cache
+    if cache is None or skip_cache or not cache_cfg.enabled:
+        return None, None
+
+    cache_key, options_hash = cache.compute_cache_key(file_records, options)
+    content_sha256 = content_sha256_from_records(file_records)
+    cache_entry = await cache.lookup(cache_key)
+    if cache_entry is not None and cache_entry.object_key:
+        logger.info("Dedup cache hit for cache_key=%s… (source=%s)", cache_key[:12], source)
+        result = await _build_cache_hit_result(
+            cache=cache_entry, file_names=file_names, store=store, cache_service=cache
+        )
+        metrics.record_task_ingested(source=source, cache_hit=True, backend=backend)
+        return cache_key, result
+
+    try:
+        await cache.create_placeholder(
+            cache_key=cache_key,
+            content_sha256=content_sha256,
+            options_hash=options_hash,
+            backend=backend,
+            parse_method=parse_method,
+            effort=options.get("effort", _DEFAULT_EFFORT),
+            ttl_seconds=cache_cfg.ttl_seconds,
+        )
+    except Exception:
+        logger.exception("Cache placeholder failed for %s — continuing without cache", cache_key[:12])
+        return None, None
+    return cache_key, None
+
+
+async def _create_task_with_payload(
+    *,
+    task_id: str,
+    payload: MultipartPayload,
+    file_names: list[str],
+    backend: str,
+    parse_method: str,
+    options: dict[str, Any],
+    cache_key: str | None,
+    store: CloudStorageProvider | None,
+    source: str,
+    settings: GatewaySettings,
+) -> None:
+    """Store the payload bytes to S3 and insert the queued Task row.
+
+    Cleans up the orphan payload object if the DB insert fails.
+    """
+    task_repo = TaskRepository.for_gateway(settings)
     payload_key: str | None = None
     try:
-        payload_key = await _store_payload(task_id=task_id, payload=payload, store=store, settings=resolved_settings)
+        payload_key = await _store_payload(task_id=task_id, payload=payload, store=store, settings=settings)
         logger.info(
             "Queued task %s (source=%s backend=%s files=%d payload_key=%s)",
             task_id,
@@ -195,16 +268,8 @@ async def ingest_payload(
         )
     except Exception:
         if payload_key is not None and store is not None:
-            try:
-                await store.delete(payload_key)
-            except Exception:
-                logger.exception("Failed to delete orphan payload %s after task insert failure", payload_key)
+            await safe_delete(store, payload_key, label="orphan payload")
         raise
-
-    metrics.record_task_ingested(source=source, cache_hit=False, backend=backend)
-    return IngestResult(
-        task_id=task_id, cache_hit=False, status="queued", response=_pending_response(task_id=task_id, source=source)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +287,10 @@ async def _build_cache_hit_result(
     return IngestResult(
         task_id=task_id,
         cache_hit=True,
-        status="completed",
-        response=JSONResponse(status_code=202, content={"task_id": task_id, "status": "completed", "source": "cache"}),
+        status=TASK_COMPLETED,
+        response=JSONResponse(
+            status_code=202, content={"task_id": task_id, "status": TASK_COMPLETED, "source": "cache"}
+        ),
     )
 
 
@@ -247,10 +314,10 @@ def _pending_response(*, task_id: str, source: str) -> JSONResponse:
         status_code=202,
         content={
             "task_id": task_id,
-            "status": "queued",
+            "status": TASK_QUEUED,
             "source": source,
-            "status_url": f"/tasks/{task_id}",
-            "result_url": f"/tasks/{task_id}/result",
+            "status_url": task_status_url(task_id),
+            "result_url": task_result_url(task_id),
         },
     )
 
@@ -268,14 +335,7 @@ def _hash_staged_payload(
 
 def _read_bounded_file(path: str, *, settings: GatewaySettings, label: str = "multipart upload") -> bytes:
     """Read a staged file in chunks while enforcing the configured byte limit."""
-    chunks: list[bytes] = []
-    total = 0
-    with open(path, "rb") as handle:
-        while chunk := handle.read(_READ_CHUNK_SIZE):
-            total += len(chunk)
-            enforce_byte_limit(total, settings=settings, label=label)
-            chunks.append(chunk)
-    return b"".join(chunks)
+    return b"".join(iter_bounded_file(path, settings=settings, label=label))
 
 
 async def stage_bounded_multipart_request(request: Request, *, settings: GatewaySettings) -> MultipartPayload:
@@ -299,7 +359,7 @@ async def stage_bounded_multipart_request(request: Request, *, settings: Gateway
                 destination = _build_upload_destination(temp_dir, filename)
                 with open(destination, "wb") as handle:
                     while True:
-                        chunk = await value.read(_READ_CHUNK_SIZE)
+                        chunk = await value.read(READ_CHUNK_SIZE)
                         if not chunk:
                             break
                         total_bytes += len(chunk)
@@ -407,25 +467,11 @@ async def extract_document(
 
     Returns ``(bytes, file_name)`` or ``(None, "")`` when the request carries no usable document.
     """
-    from mineru_gateway.gateway.admission import enforce_byte_limit
-
     resolved_settings = settings
     doc = body.document
 
     if doc.type == "file" and doc.file:
-        try:
-            encoded = doc.file.strip()
-            padding = (-len(encoded)) % 4
-            estimated = (len(encoded) + padding) * 3 // 4
-            enforce_byte_limit(estimated, settings=resolved_settings, label="base64 document")
-            data = base64.b64decode(encoded, validate=True)
-            enforce_byte_limit(len(data), settings=resolved_settings, label="base64 document")
-            return data, doc.file_name or "document"
-        except HTTPException:
-            raise
-        except Exception:
-            logger.warning("Failed to base64-decode inline document file", exc_info=True)
-            return None, ""
+        return _decode_inline_file(doc, settings=resolved_settings)
 
     if doc.type in ("document_url", "image_url"):
         url = doc.document_url or doc.image_url
@@ -437,26 +483,48 @@ async def extract_document(
             backend="",
             server_url=url,
         )
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                async with client.stream("GET", url) as resp:
-                    resp.raise_for_status()
-                    chunks: list[bytes] = []
-                    total = 0
-                    async for chunk in resp.aiter_bytes():
-                        total += len(chunk)
-                        enforce_byte_limit(total, settings=resolved_settings, label="downloaded document")
-                        chunks.append(chunk)
-                    data = b"".join(chunks)
-                name = url.rsplit("/", 1)[-1] or "document"
-                return data, name
-        except HTTPException:
-            raise
-        except Exception:
-            logger.warning("Failed to fetch document from %s", url, exc_info=True)
-            return None, ""
+        return await _fetch_document_url(url, settings=resolved_settings)
 
     return None, ""
+
+
+def _decode_inline_file(doc: Any, *, settings: GatewaySettings) -> tuple[bytes | None, str]:
+    """Decode a base64-encoded inline document, enforcing the byte limit on the encoded + decoded sizes."""
+    try:
+        encoded = doc.file.strip()
+        padding = (-len(encoded)) % 4
+        estimated = (len(encoded) + padding) * 3 // 4
+        enforce_byte_limit(estimated, settings=settings, label="base64 document")
+        data = base64.b64decode(encoded, validate=True)
+        enforce_byte_limit(len(data), settings=settings, label="base64 document")
+        return data, doc.file_name or "document"
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to base64-decode inline document file")
+        return None, ""
+
+
+async def _fetch_document_url(url: str, *, settings: GatewaySettings) -> tuple[bytes | None, str]:
+    """Stream-download a document from ``url``, enforcing the byte limit on the running total."""
+    try:
+        async with httpx.AsyncClient(timeout=DOCUMENT_DOWNLOAD_TIMEOUT) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    enforce_byte_limit(total, settings=settings, label="downloaded document")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+            name = url.rsplit("/", 1)[-1] or "document"
+            return data, name
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to fetch document from %s", url)
+        return None, ""
 
 
 def build_payload(file_bytes: bytes, file_name: str, body: OCRRequest) -> MultipartPayload:

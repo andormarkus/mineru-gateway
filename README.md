@@ -40,6 +40,6 @@ Object storage is mandatory. Configure the active cloud provider bucket/containe
 
 Configure a bucket lifecycle policy (or equivalent) to expire orphaned objects under `payloads/`, `results/`, and `cache/` as a safety net. The scheduler deletes objects when tasks and cache entries age out, but lifecycle rules catch leaks from crashes or partial failures.
 
-Set `max_file_size_bytes` in config and enforce the same or smaller HTTP request-body limit at your reverse proxy or ingress. Starlette parses multipart forms before the gateway copy loop runs.
+Set `max_file_size_bytes` as a soft upload cap (0 = use the fixed 1 GiB hard maximum only). Also enforce the same or smaller request-body limit at your reverse proxy or ingress. Starlette parses multipart forms before the gateway copy loop runs.
 
 See [`config.example.yaml`](config.example.yaml) for configuration. Run `task checks-full` before shipping.

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from mineru_gateway.config import GatewaySettings
 from mineru_gateway.db.models import Worker
+from mineru_gateway.gateway.task_flow import require_store
 from mineru_gateway.scheduler.cache_service import CacheService
 from mineru_gateway.scheduler.worker_repository import WorkerRepository
 from mineru_gateway.util.datetime import to_iso
@@ -55,6 +56,13 @@ async def drain_worker(worker_id: str, body: DrainWorkerRequest, request: Reques
     )
     if row is None:
         return JSONResponse(status_code=404, content={"detail": "Worker not found"})
+    logger.info(
+        "Admin drain worker=%s terminate=%s reason=%s requester=%s",
+        worker_id,
+        body.terminate,
+        body.reason,
+        body.requester,
+    )
     return JSONResponse(content=_worker_dict(row))
 
 
@@ -63,6 +71,7 @@ async def rotate_worker(worker_id: str, body: EmergencyCommandRequest, request: 
     row = await _workers_repo(request).set_rotation_requested(worker_id, reason=body.reason, requester=body.requester)
     if row is None:
         return JSONResponse(status_code=404, content={"detail": "Worker not found"})
+    logger.info("Admin rotate worker=%s reason=%s requester=%s", worker_id, body.reason, body.requester)
     return JSONResponse(content=_worker_dict(row))
 
 
@@ -71,28 +80,31 @@ async def recover_worker(worker_id: str, body: EmergencyCommandRequest, request:
     row = await _workers_repo(request).recover_worker(worker_id, reason=body.reason, requester=body.requester)
     if row is None:
         return JSONResponse(status_code=404, content={"detail": "Worker not found"})
+    logger.info("Admin recover worker=%s reason=%s requester=%s", worker_id, body.reason, body.requester)
     return JSONResponse(content=_worker_dict(row))
 
 
 @router.delete("/cache/{cache_key}")
 async def invalidate_cache(cache_key: str, request: Request) -> JSONResponse:
     settings: GatewaySettings = request.app.state.settings
-    store = getattr(request.app.state, "object_store", None)
-    if store is None:
-        return JSONResponse(status_code=503, content={"detail": "Object store not configured"})
+    store = require_store(request, detail="Object store not configured")
+    if isinstance(store, JSONResponse):
+        return store
     cache = CacheService(settings, store)
     if not await cache.invalidate(cache_key):
         return JSONResponse(status_code=404, content={"detail": "Cache entry not found"})
+    logger.info("Admin cache invalidate key=%s…", cache_key[:12])
     return JSONResponse(content={"invalidated": cache_key})
 
 
 @router.post("/cache/sweep")
 async def sweep_cache(request: Request) -> JSONResponse:
     settings: GatewaySettings = request.app.state.settings
-    store = getattr(request.app.state, "object_store", None)
-    if store is None:
-        return JSONResponse(status_code=503, content={"detail": "Object store not configured"})
+    store = require_store(request, detail="Object store not configured")
+    if isinstance(store, JSONResponse):
+        return store
     removed = await CacheService(settings, store).sweep_expired()
+    logger.info("Admin cache sweep removed=%d", removed)
     return JSONResponse(content={"removed": removed})
 
 

@@ -10,6 +10,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from mineru_gateway.config import GatewaySettings
+from mineru_gateway.observability._setup import log_otel_unavailable, otel_resource
 from mineru_gateway.observability.metrics import metrics
 
 if TYPE_CHECKING:
@@ -45,11 +46,10 @@ def init_otel(*, settings: GatewaySettings, app: FastAPI | None = None, service_
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-        from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-        resource = Resource.create({"service.name": resolved_name})
+        resource = otel_resource(resolved_name)
         provider = TracerProvider(resource=resource)
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
         trace.set_tracer_provider(provider)
@@ -60,4 +60,4 @@ def init_otel(*, settings: GatewaySettings, app: FastAPI | None = None, service_
         logger.info("OTel traces enabled: service=%s endpoint=%s", resolved_name, endpoint)
 
     except ImportError:
-        logger.warning("OTel enabled but opentelemetry packages not installed. Install with: uv sync --extra otel")
+        log_otel_unavailable()

@@ -17,13 +17,14 @@ from mineru_gateway.db.models import Task
 from mineru_gateway.gateway.admission import check_admission
 from mineru_gateway.gateway.ingest import ingest_task
 from mineru_gateway.gateway.task_flow import (
-    client_sla_expired_response,
     fetch_result_or_none,
     get_store,
-    is_poll_complete,
     poll_task_until_terminal,
-    try_fetch_result_bytes,
+    require_store,
+    resolve_sync_result,
 )
+from mineru_gateway.tasks.status import TASK_COMPLETED, TASK_EXPIRED, TASK_FAILED
+from mineru_gateway.tasks.storage import task_result_url, task_status_url
 from mineru_gateway.util.datetime import to_iso
 
 logger = logging.getLogger(__name__)
@@ -34,13 +35,9 @@ router = APIRouter(tags=["tasks"])
 async def submit_task(request: Request) -> Response:
     """Enqueue an async parse task. The scheduler process dispatches it to a worker."""
     await check_admission(request)
-    store = get_store(request)
-    if store is None:
-        logger.error("Task submit rejected: object store not configured")
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Object store not configured — POST /tasks requires durable payload storage."},
-        )
+    store = require_store(request, detail="Object store not configured — POST /tasks requires durable payload storage.")
+    if isinstance(store, JSONResponse):
+        return store
     result = await ingest_task(request, store=store, settings=request.app.state.settings)
     logger.info("Submitted task %s (cache_hit=%s status=%s)", result.task_id, result.cache_hit, result.status)
     return result.response
@@ -66,8 +63,8 @@ async def get_task_status(task_id: str, request: Request) -> Response:
             "started_at": to_iso(row.started_at),
             "completed_at": to_iso(row.completed_at),
             "client_expired_at": to_iso(row.client_expired_at),
-            "status_url": f"/tasks/{task_id}",
-            "result_url": f"/tasks/{task_id}/result",
+            "status_url": task_status_url(task_id),
+            "result_url": task_result_url(task_id),
         }
     )
 
@@ -81,10 +78,10 @@ async def get_task_result(task_id: str, request: Request) -> Response:
         logger.debug("Task result lookup: %s not found", task_id)
         return JSONResponse(status_code=404, content={"detail": "Task not found"})
 
-    if row.status in ("failed", "expired"):
+    if row.status in (TASK_FAILED, TASK_EXPIRED):
         logger.warning("Task result lookup: %s %s (%s)", task_id, row.status, row.error)
         return JSONResponse(status_code=409, content={"detail": "Task execution failed", "error": row.error})
-    if row.status != "completed" or not row.result_key:
+    if row.status != TASK_COMPLETED or not row.result_key:
         logger.debug("Task result lookup: %s not ready (status=%s)", task_id, row.status)
         return JSONResponse(
             status_code=202,
@@ -110,13 +107,9 @@ async def get_task_result(task_id: str, request: Request) -> Response:
 async def file_parse(request: Request) -> Response:
     """Synchronous parse: ingest, poll DB until terminal, return result."""
     await check_admission(request)
-    store = get_store(request)
-    if store is None:
-        logger.error("file_parse rejected: object store not configured")
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Object store not configured — /file_parse requires durable payload storage."},
-        )
+    store = require_store(request, detail="Object store not configured — /file_parse requires durable payload storage.")
+    if isinstance(store, JSONResponse):
+        return store
     result = await ingest_task(request, store=store, settings=request.app.state.settings)
     logger.info("file_parse started for task %s (cache_hit=%s)", result.task_id, result.cache_hit)
 
@@ -129,28 +122,7 @@ async def file_parse(request: Request) -> Response:
 
     # Poll the DB until the scheduler dispatches and the task reaches terminal state.
     row = await poll_task_until_terminal(result.task_id, route="file_parse")
-    if row is None:
-        logger.warning("file_parse failed for task %s: task disappeared", result.task_id)
-        return JSONResponse(status_code=409, content={"detail": "Task execution failed", "error": "task disappeared"})
-    if row.status in ("failed", "expired"):
-        logger.warning("file_parse failed for task %s: %s", result.task_id, row.error)
-        return JSONResponse(status_code=409, content={"detail": "Task execution failed", "error": row.error})
-
-    data = await try_fetch_result_bytes(result.task_id, row, store)
-    if data is not None:
-        logger.info("file_parse completed for task %s (%d bytes)", result.task_id, len(data))
-        return Response(content=data, media_type="application/zip")
-
-    if row.client_expired_at is not None:
-        logger.info("file_parse client SLA expired for task %s (status=%s)", result.task_id, row.status)
-        return client_sla_expired_response(result.task_id, status=row.status)
-
-    if not is_poll_complete(row):
-        logger.warning("file_parse timed out for task %s (status=%s)", result.task_id, row.status)
-        return JSONResponse(
-            status_code=202,
-            content={"task_id": result.task_id, "status": row.status, "message": "Task result is not ready yet"},
-        )
-
-    logger.warning("file_parse completed for task %s but result not in object store", result.task_id)
-    return JSONResponse(status_code=404, content={"detail": "Result not yet stored"})
+    resolved = await resolve_sync_result(task_id=result.task_id, row=row, store=store, route="file_parse")
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    return Response(content=resolved, media_type="application/zip")

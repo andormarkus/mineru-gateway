@@ -7,17 +7,23 @@ import logging
 
 from fastapi import HTTPException, Request
 
-from mineru_gateway.config import GatewaySettings
+from mineru_gateway.config import MAX_FILE_SIZE_HARD_BYTES, GatewaySettings
 from mineru_gateway.observability.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
 
+def effective_file_size_limit(settings: GatewaySettings) -> int:
+    """Return the enforced byte limit: min(soft, hard), or hard when soft is unset (0)."""
+    soft = settings.max_file_size_bytes
+    if soft <= 0:
+        return MAX_FILE_SIZE_HARD_BYTES
+    return min(soft, MAX_FILE_SIZE_HARD_BYTES)
+
+
 def check_file_size(content_length: int | None, *, settings: GatewaySettings) -> None:
-    """Reject with 413 if the upload exceeds ``max_file_size_bytes`` (Content-Length preflight)."""
-    limit = settings.max_file_size_bytes
-    if limit <= 0:
-        return
+    """Reject with 413 if the upload exceeds the effective size limit (Content-Length preflight)."""
+    limit = effective_file_size_limit(settings)
     if content_length is not None and content_length > limit:
         logger.warning("Rejecting upload: content-length %d exceeds limit %d", content_length, limit)
         metrics.record_admission_rejected(reason="file_too_large")
@@ -25,10 +31,8 @@ def check_file_size(content_length: int | None, *, settings: GatewaySettings) ->
 
 
 def enforce_byte_limit(size: int, *, settings: GatewaySettings, label: str = "upload") -> None:
-    """Reject when accumulated bytes exceed the configured limit."""
-    limit = settings.max_file_size_bytes
-    if limit <= 0:
-        return
+    """Reject when accumulated bytes exceed the effective size limit."""
+    limit = effective_file_size_limit(settings)
     if size > limit:
         logger.warning("Rejecting %s: %d bytes exceeds limit %d", label, size, limit)
         metrics.record_admission_rejected(reason="file_too_large")

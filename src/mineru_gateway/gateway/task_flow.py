@@ -20,6 +20,7 @@ from mineru_gateway.db.models import Task
 from mineru_gateway.observability.metrics import metrics
 from mineru_gateway.tasks.results import read_result
 from mineru_gateway.tasks.status import TASK_COMPLETED, TASK_EXPIRED, TASK_FAILED
+from mineru_gateway.tasks.storage import task_result_url, task_status_url
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,19 @@ _POLL_INTERVAL_SECONDS = 1.0
 def get_store(request: Request) -> CloudStorageProvider | None:
     """Get the object store from app.state (None when no S3 backend is configured)."""
     return getattr(request.app.state, "object_store", None)
+
+
+def require_store(request: Request, *, detail: str) -> CloudStorageProvider | JSONResponse:
+    """Return the configured object store, or a 503 ``JSONResponse`` when none is configured.
+
+    Routes that need durable storage call this and early-return when the result is a
+    ``JSONResponse``. The 503 is logged at WARNING (expected operational state, not an error).
+    """
+    store = get_store(request)
+    if store is None:
+        logger.warning("Request rejected: object store not configured")
+        return JSONResponse(status_code=503, content={"detail": detail})
+    return store
 
 
 def is_poll_complete(row: Task) -> bool:
@@ -52,8 +66,8 @@ def client_sla_expired_response(task_id: str, *, status: str) -> JSONResponse:
             "status": status,
             "client_sla_expired": True,
             "message": "Client SLA expired; task execution continues. Check status and result endpoints.",
-            "status_url": f"/tasks/{task_id}",
-            "result_url": f"/tasks/{task_id}/result",
+            "status_url": task_status_url(task_id),
+            "result_url": task_result_url(task_id),
         },
     )
 
@@ -63,6 +77,42 @@ async def try_fetch_result_bytes(task_id: str, row: Task, store: CloudStoragePro
     if store is None or row.status != TASK_COMPLETED or not row.result_key:
         return None
     return await fetch_result_or_none(task_id=task_id, store=store)
+
+
+async def resolve_sync_result(
+    *, task_id: str, row: Task | None, store: CloudStorageProvider | None, route: str
+) -> bytes | JSONResponse:
+    """Resolve a polled task to either success bytes or a terminal ``JSONResponse``.
+
+    Shared decision ladder for the synchronous routes (``/file_parse``, ``/v1/ocr``): after
+    :func:`poll_task_until_terminal` returns, the caller passes the row here. Returns the raw
+    result ``bytes`` on success (the caller wraps them in its route-specific response), or a
+    ``JSONResponse`` for every terminal branch (disappeared / failed / SLA-expired / not-ready / 404).
+    """
+    if row is None:
+        logger.warning("%s failed for task %s: task disappeared", route, task_id)
+        return JSONResponse(status_code=409, content={"detail": "Processing failed", "error": "task disappeared"})
+    if row.status in _FAILURE_STATUSES:
+        logger.warning("%s failed for task %s: %s", route, task_id, row.error)
+        return JSONResponse(status_code=409, content={"detail": "Processing failed", "error": row.error})
+
+    data = await try_fetch_result_bytes(task_id, row, store)
+    if data is not None:
+        logger.info("%s completed for task %s (%d bytes)", route, task_id, len(data))
+        return data
+
+    if row.client_expired_at is not None:
+        logger.info("%s client SLA expired for task %s (status=%s)", route, task_id, row.status)
+        return client_sla_expired_response(task_id, status=row.status)
+
+    if not is_poll_complete(row):
+        logger.warning("%s timed out for task %s (status=%s)", route, task_id, row.status)
+        return JSONResponse(
+            status_code=202, content={"task_id": task_id, "status": row.status, "message": "Result is not ready yet"}
+        )
+
+    logger.warning("%s completed for task %s but result not in object store", route, task_id)
+    return JSONResponse(status_code=404, content={"detail": "Result not yet stored"})
 
 
 async def _load_task(task_id: str) -> Task | None:

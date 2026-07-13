@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.expression import ScalarSelect
 
+from mineru_gateway.cloud.types import (
+    CLOUD_STATE_PENDING,
+    CLOUD_STATE_RUNNING,
+    CLOUD_STATE_STOPPED,
+    CLOUD_STATE_TERMINATED,
+    CLOUD_STATE_UNKNOWN,
+)
 from mineru_gateway.config import GatewaySettings
 from mineru_gateway.db.base import get_db_session
 from mineru_gateway.db.models import ScalingEvent, Task, Worker
@@ -16,8 +26,12 @@ from mineru_gateway.tasks.status import (
     TASK_STATUSES_AUTOSCALE_DEMAND,
     TASK_STATUSES_COMPUTE_CAPACITY,
     TASK_STATUSES_DRAIN_BLOCKERS,
+    TASK_STORING_RESULT,
 )
 from mineru_gateway.util.datetime import now_utc
+from mineru_gateway.util.ids import worker_id
+
+logger = logging.getLogger(__name__)
 
 _RETRY_SECONDS: tuple[int, ...] = (5, 15, 30, 60, 120)
 _RETRY_CAP_SECONDS = 300
@@ -33,7 +47,7 @@ class WorkerRepository:
     def __init__(self, settings: GatewaySettings) -> None:
         self._settings = settings
 
-    def _deployment_clause(self):
+    def _deployment_clause(self) -> ColumnElement[bool]:
         return and_(
             Worker.deployment_id == self._settings.deployment_id,
             Worker.provider == self._settings.cloud.provider,
@@ -57,27 +71,27 @@ class WorkerRepository:
                 setattr(row, key, value)
             await session.commit()
 
-    def _stalled_clause(self):
+    def _stalled_clause(self) -> ColumnElement[bool]:
         return Worker.failure_count >= self._settings.reconciliation.max_failure_count
 
-    def _serviceable_clause(self):
+    def _serviceable_clause(self) -> ColumnElement[bool]:
         return and_(
             self._deployment_clause(),
-            Worker.desired_state == "running",
-            Worker.cloud_state == "running",
+            Worker.desired_state == CLOUD_STATE_RUNNING,
+            Worker.cloud_state == CLOUD_STATE_RUNNING,
             Worker.healthy.is_(True),
             Worker.base_url.isnot(None),
             Worker.draining.is_(False),
             Worker.failure_count < self._settings.reconciliation.max_failure_count,
         )
 
-    def _ready_serviceable_clause(self):
+    def _ready_serviceable_clause(self) -> ColumnElement[bool]:
         return and_(self._serviceable_clause(), Worker.ready_at.isnot(None))
 
-    def _dispatchable_clause(self, *, active_count):
+    def _dispatchable_clause(self, *, active_count: ScalarSelect[int]) -> ColumnElement[bool]:
         return and_(self._serviceable_clause(), active_count < self._settings.scaling.target_per_worker)
 
-    def _compute_capacity_subquery(self):
+    def _compute_capacity_subquery(self) -> ScalarSelect[int]:
         return (
             select(func.count(Task.task_id))
             .where(Task.worker_id == Worker.id, Task.status.in_(TASK_STATUSES_COMPUTE_CAPACITY))
@@ -85,7 +99,7 @@ class WorkerRepository:
             .scalar_subquery()
         )
 
-    def _drain_blocker_subquery(self):
+    def _drain_blocker_subquery(self) -> ScalarSelect[int]:
         return (
             select(func.count(Task.task_id))
             .where(Task.worker_id == Worker.id, Task.status.in_(TASK_STATUSES_DRAIN_BLOCKERS))
@@ -126,8 +140,8 @@ class WorkerRepository:
         async with get_db_session() as session:
             query = select(func.count(Worker.id)).where(
                 self._deployment_clause(),
-                Worker.desired_state == "running",
-                Worker.cloud_state.in_(("pending", "unknown", "starting")),
+                Worker.desired_state == CLOUD_STATE_RUNNING,
+                Worker.cloud_state.in_((CLOUD_STATE_PENDING, CLOUD_STATE_UNKNOWN, "starting")),
                 Worker.draining.is_(False),
                 Worker.failure_count < max_failures,
             )
@@ -138,7 +152,7 @@ class WorkerRepository:
             query = select(Worker).where(
                 self._deployment_clause(),
                 self._stalled_clause(),
-                Worker.desired_state != "terminated",
+                Worker.desired_state != CLOUD_STATE_TERMINATED,
                 Worker.terminated_at.is_(None),
             )
             return list((await session.execute(query)).scalars().all())
@@ -148,7 +162,7 @@ class WorkerRepository:
             query = select(func.count(Worker.id)).where(
                 self._deployment_clause(),
                 self._stalled_clause(),
-                Worker.desired_state != "terminated",
+                Worker.desired_state != CLOUD_STATE_TERMINATED,
                 Worker.terminated_at.is_(None),
             )
             return (await session.execute(query)).scalar() or 0
@@ -167,8 +181,8 @@ class WorkerRepository:
                 select(Worker)
                 .where(
                     self._deployment_clause(),
-                    Worker.desired_state == "stopped",
-                    Worker.cloud_state == "stopped",
+                    Worker.desired_state == CLOUD_STATE_STOPPED,
+                    Worker.cloud_state == CLOUD_STATE_STOPPED,
                     Worker.instance_id.isnot(None),
                     Worker.draining.is_(False),
                 )
@@ -183,8 +197,8 @@ class WorkerRepository:
                 select(Worker)
                 .where(
                     self._deployment_clause(),
-                    Worker.desired_state == "running",
-                    Worker.cloud_state == "running",
+                    Worker.desired_state == CLOUD_STATE_RUNNING,
+                    Worker.cloud_state == CLOUD_STATE_RUNNING,
                     Worker.healthy.is_(True),
                     Worker.draining.is_(False),
                     Worker.replacement_for.is_(None),
@@ -199,7 +213,7 @@ class WorkerRepository:
     async def find_draining_workers(self) -> list[Worker]:
         async with get_db_session() as session:
             query = select(Worker).where(
-                self._deployment_clause(), Worker.draining.is_(True), Worker.desired_state != "terminated"
+                self._deployment_clause(), Worker.draining.is_(True), Worker.desired_state != CLOUD_STATE_TERMINATED
             )
             return list((await session.execute(query)).scalars().all())
 
@@ -214,7 +228,7 @@ class WorkerRepository:
         async with get_db_session() as session:
             query = select(func.count(Task.task_id)).where(
                 Task.worker_id == worker_id,
-                Task.status == "storing_result",
+                Task.status == TASK_STORING_RESULT,
                 or_(Task.result_key.is_(None), Task.result_key == ""),
             )
             return (await session.execute(query)).scalar() or 0
@@ -235,7 +249,7 @@ class WorkerRepository:
                 self._deployment_clause(),
                 Worker.replacement_for == worker_id,
                 Worker.terminated_at.is_(None),
-                Worker.desired_state != "terminated",
+                Worker.desired_state != CLOUD_STATE_TERMINATED,
             )
             return ((await session.execute(query)).scalar() or 0) > 0
 
@@ -244,7 +258,7 @@ class WorkerRepository:
             query = select(func.count(Worker.id)).where(
                 self._deployment_clause(),
                 Worker.replacement_for.isnot(None),
-                Worker.desired_state != "terminated",
+                Worker.desired_state != CLOUD_STATE_TERMINATED,
                 Worker.terminated_at.is_(None),
             )
             return (await session.execute(query)).scalar() or 0
@@ -256,11 +270,11 @@ class WorkerRepository:
             )
             return list((await session.execute(query)).scalars().all())
 
-    def _rotation_eligible_clause(self):
+    def _rotation_eligible_clause(self) -> ColumnElement[bool]:
         return and_(
             self._deployment_clause(),
-            Worker.desired_state == "running",
-            Worker.cloud_state == "running",
+            Worker.desired_state == CLOUD_STATE_RUNNING,
+            Worker.cloud_state == CLOUD_STATE_RUNNING,
             Worker.healthy.is_(True),
             Worker.draining.is_(False),
             Worker.replacement_for.is_(None),
@@ -293,8 +307,8 @@ class WorkerRepository:
         async with get_db_session() as session:
             query = select(Worker).where(
                 self._deployment_clause(),
-                Worker.desired_state == "terminated",
-                Worker.cloud_state == "terminated",
+                Worker.desired_state == CLOUD_STATE_TERMINATED,
+                Worker.cloud_state == CLOUD_STATE_TERMINATED,
                 Worker.terminated_at.is_(None),
             )
             return list((await session.execute(query)).scalars().all())
@@ -354,22 +368,39 @@ class WorkerRepository:
 
     async def record_failure(self, worker_id: str, error: str, *, retryable: bool) -> None:
         max_failures = self._settings.reconciliation.max_failure_count
+        stalled = False
+        failure_count = 0
+        retry_after: datetime | None = None
         async with get_db_session() as session:
             row = await session.get(Worker, worker_id)
             if row is None:
                 return
             row.failure_count += 1
             row.last_error = error
+            failure_count = row.failure_count
             if row.failure_count >= max_failures:
+                stalled = True
                 row.healthy = False
                 row.retry_after = None
                 if row.stalled_at is None:
                     row.stalled_at = now_utc()
                 row.draining = True
-                row.drain_target = "terminated"
+                row.drain_target = CLOUD_STATE_TERMINATED
             elif retryable:
                 row.retry_after = now_utc() + timedelta(seconds=retry_delay(row.failure_count))
+            retry_after = row.retry_after
             await session.commit()
+        if stalled:
+            logger.error("Worker %s stalled — draining", worker_id)
+        else:
+            logger.warning(
+                "Worker %s failure #%d retryable=%s retry_after=%s error=%s",
+                worker_id,
+                failure_count,
+                retryable,
+                retry_after,
+                error,
+            )
 
     async def apply_health_checks(self, results: list[tuple[Worker, bool, str | None]]) -> int:
         healthy_count = 0
@@ -382,7 +413,11 @@ class WorkerRepository:
                 if ok:
                     row.healthy = True
                     row.last_error = None
-                    if row.desired_state == "running" and row.cloud_state == "running" and row.ready_at is None:
+                    if (
+                        row.desired_state == CLOUD_STATE_RUNNING
+                        and row.cloud_state == CLOUD_STATE_RUNNING
+                        and row.ready_at is None
+                    ):
                         row.ready_at = now_utc()
                         row.start_requested_at = None
                     healthy_count += 1
@@ -395,21 +430,20 @@ class WorkerRepository:
         return healthy_count
 
     async def create_cloud_worker(self) -> str:
-        import uuid
-
-        worker_id = f"cloud-{uuid.uuid4().hex[:12]}"
+        new_worker_id = worker_id()
         worker = Worker(
-            id=worker_id,
+            id=new_worker_id,
             provider=self._settings.cloud.provider,
             deployment_id=self._settings.deployment_id,
-            desired_state="running",
-            cloud_state="pending",
+            desired_state=CLOUD_STATE_RUNNING,
+            cloud_state=CLOUD_STATE_PENDING,
             start_requested_at=now_utc(),
         )
         async with get_db_session() as session:
             session.add(worker)
             await session.commit()
-        return worker_id
+        logger.info("Created worker id=%s", new_worker_id)
+        return new_worker_id
 
     async def reset_cloud_failures(self, worker_id: str) -> None:
         async with get_db_session() as session:
@@ -429,8 +463,8 @@ class WorkerRepository:
     async def finalize_disappeared_instance(self, worker_id: str, *, reason: str) -> None:
         await self.commit_fields(
             worker_id,
-            desired_state="terminated",
-            cloud_state="terminated",
+            desired_state=CLOUD_STATE_TERMINATED,
+            cloud_state=CLOUD_STATE_TERMINATED,
             instance_id=None,
             base_url=None,
             ready_at=None,
@@ -453,15 +487,13 @@ class WorkerRepository:
             await session.commit()
 
     async def start_rotation_replacement(self, old: Worker) -> str:
-        import uuid
-
-        replacement_id = f"cloud-{uuid.uuid4().hex[:12]}"
+        replacement_id = worker_id()
         replacement = Worker(
             id=replacement_id,
             provider=self._settings.cloud.provider,
             deployment_id=self._settings.deployment_id,
-            desired_state="running",
-            cloud_state="pending",
+            desired_state=CLOUD_STATE_RUNNING,
+            cloud_state=CLOUD_STATE_PENDING,
             replacement_for=old.id,
             generation=old.generation + 1,
             start_requested_at=now_utc(),
@@ -502,6 +534,10 @@ class WorkerRepository:
             )
             await session.commit()
             await session.refresh(row)
+            logger.info(
+                "Drain intent worker=%s target=%s reason=%s requester=%s", worker_id, drain_target, reason, requester
+            )
+            metrics.record_worker_scaled(action="drain")
             return row
 
     async def set_rotation_requested(
@@ -517,6 +553,7 @@ class WorkerRepository:
             )
             await session.commit()
             await session.refresh(row)
+            logger.info("Rotation requested worker=%s reason=%s requester=%s", worker_id, reason, requester)
             return row
 
     async def recover_worker(self, worker_id: str, *, reason: str, requester: str | None = None) -> Worker | None:
@@ -535,7 +572,14 @@ class WorkerRepository:
             )
             await session.commit()
             await session.refresh(row)
+            logger.info("Worker recovered worker=%s reason=%s requester=%s", worker_id, reason, requester)
             return row
 
     def _row_in_deployment(self, row: Worker) -> bool:
+        """In-memory mirror of :meth:`_deployment_clause` for a fetched row.
+
+        ``_deployment_clause`` expresses the same (deployment_id, provider, not-terminated) filter
+        in SQL; this Python variant is used when the row is already loaded and we only need to
+        confirm membership without re-querying. Keep the two in sync.
+        """
         return row.deployment_id == self._settings.deployment_id and row.provider == self._settings.cloud.provider

@@ -24,7 +24,7 @@ deployment_id: "dev-local"
 # Process log level (DEBUG | INFO | WARNING | ERROR).
 log_level: "INFO"
 
-# Max upload size in bytes (0 = unlimited). Enforced during gateway staging and OCR extraction.
+# Soft upload limit in bytes (0 = only the 1 GiB hard cap applies). Cannot exceed the hard maximum.
 # Configure the reverse proxy or ingress with the same or smaller request-body limit so multipart
 # parsing cannot spool unbounded data before these checks run.
 max_file_size_bytes: 0

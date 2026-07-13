@@ -6,14 +6,14 @@ Run via ``task run`` or directly as ``mineru-gateway`` (the console script).
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import click
 import uvicorn
 
 from mineru_gateway import __version__
-from mineru_gateway.config import load_settings, reset_settings_cache
+from mineru_gateway.cli import load_settings_from_cli
 from mineru_gateway.gateway.app import create_app
-from mineru_gateway.logging_config import configure_logging
 from mineru_gateway.startup_guard import enforce_bind_guard
 
 logger = logging.getLogger(__name__)
@@ -42,23 +42,18 @@ def main(
     host: str | None, port: int | None, config_path: str, database_url: str | None, reload: bool, log_level: str | None
 ) -> None:
     """Run the mineru-gateway server."""
-    reset_settings_cache()
-    cli_overrides: dict[str, object] = {}
+    overrides: dict[str, Any] = {}
     if host is not None:
-        cli_overrides["host"] = host
+        overrides["host"] = host
     if port is not None:
-        cli_overrides["port"] = port
-    if database_url:
-        cli_overrides["database_url"] = database_url
-    if log_level:
-        cli_overrides["log_level"] = log_level
-    settings = load_settings(config_path, **cli_overrides)
+        overrides["port"] = port
+    settings, resolved_level = load_settings_from_cli(
+        config_path=config_path, database_url=database_url, log_level=log_level, **overrides
+    )
 
     bind_host = host if host is not None else settings.host
     bind_port = port if port is not None else settings.port
 
-    resolved_level = log_level or settings.log_level
-    configure_logging(resolved_level)
     logger.info("Starting gateway (host=%s port=%d log_level=%s)", bind_host, bind_port, resolved_level.upper())
 
     enforce_bind_guard(settings, cli_host=bind_host)

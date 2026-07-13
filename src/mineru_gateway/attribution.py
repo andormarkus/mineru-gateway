@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from mineru_gateway.mineru_compat import MINERU_VERSION
 
@@ -31,7 +31,7 @@ def upstream_info() -> dict[str, str]:
     return {"name": UPSTREAM_NAME, "version": MINERU_VERSION, "homepage": UPSTREAM_HOMEPAGE}
 
 
-async def attribution_middleware(request: Request, call_next) -> Response:
+async def attribution_middleware(request: Request, call_next: RequestResponseEndpoint) -> Response:
     """Starlette/FastAPI middleware: stamp attribution headers on every response.
 
     MinerU §2: an online service built on MinerU must clearly indicate MinerU is used. Doing it in a middleware

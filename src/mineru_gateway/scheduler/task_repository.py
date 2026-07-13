@@ -9,10 +9,11 @@ import struct
 import tempfile
 import time
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from sqlalchemy import or_, select
+from sqlalchemy.sql.elements import ColumnElement
 
 from mineru_gateway.cloud.base import CloudStorageProvider
 from mineru_gateway.config import GatewaySettings
@@ -20,8 +21,9 @@ from mineru_gateway.db.base import get_db_session
 from mineru_gateway.db.models import Task, Worker
 from mineru_gateway.mineru_compat import MultipartPayload, StagedUpload, submit_payload_to_upstream
 from mineru_gateway.observability.metrics import metrics
+from mineru_gateway.scheduler._http import RESULT_FETCH_TIMEOUT_SECONDS, UPSTREAM_REFRESH_TIMEOUT, worker_json_get
 from mineru_gateway.scheduler.worker_repository import WorkerRepository
-from mineru_gateway.tasks.errors import should_retry
+from mineru_gateway.tasks.errors import classify_error, should_retry
 from mineru_gateway.tasks.status import (
     TASK_COMPLETED,
     TASK_DISPATCHING,
@@ -43,8 +45,9 @@ _HEALTH_BATCH = 32
 _DISPATCH_CLAIM_TIMEOUT_SECONDS = 120
 _SYNC_CONCURRENCY = 4
 _RESULT_CONCURRENCY = 4
-_RESULT_FETCH_TIMEOUT_SECONDS = 30.0
 _POLL_RETRY_DELAY_SECONDS = 30.0
+
+_DispatchFailureOutcome = Worker | Literal["requeued", "failed"]
 
 
 class TaskRepository:
@@ -172,7 +175,11 @@ class TaskRepository:
                 row.dispatch_started_at = None
                 row.worker_id = None
             await session.commit()
-            return len(rows)
+            recovered = len(rows)
+            if recovered:
+                logger.info("Recovered %d stale dispatch claims", recovered)
+                metrics.record_stale_claims_recovered(count=recovered)
+            return recovered
 
     async def dispatch_queued_tasks(self, *, max_per_tick: int = 32) -> int:
         dispatched = 0
@@ -200,6 +207,7 @@ class TaskRepository:
                 return None
             worker = await self._require_workers().acquire_dispatchable(session)
             if worker is None:
+                logger.info("Dispatch deferred task=%s reason=no_dispatchable_worker", candidate.task_id)
                 return None
             candidate.status = TASK_DISPATCHING
             candidate.dispatch_started_at = now_utc()
@@ -214,15 +222,16 @@ class TaskRepository:
         while True:
             payload = await self._rebuild_payload(task)
             if payload is None:
+                logger.warning("Task failed at dispatch task=%s reason=payload_missing", task.task_id)
                 await self._mark_failed(task.task_id, error="Payload unavailable in object storage")
                 metrics.record_dispatch_failed(error_class="payload_missing")
+                metrics.record_dispatch_duration(outcome="failed", duration_ms=(time.perf_counter() - start) * 1000)
                 return False
 
             base_url = worker.base_url or ""
             if not base_url:
                 payload.cleanup()
-                excluded.add(worker.id)
-                reassigned = await self._reassign_dispatch_worker(task.task_id, excluded_ids=excluded)
+                reassigned = await self._reassign_after_exclusion(task, worker, excluded, start=start)
                 if reassigned is None:
                     return False
                 worker = reassigned
@@ -230,32 +239,73 @@ class TaskRepository:
 
             try:
                 upstream = await submit_payload_to_upstream(base_url, payload)
-                payload.cleanup()
-                await self._mark_processing(
-                    task.task_id,
-                    worker_id=worker.id,
-                    upstream_task_id=upstream["task_id"],
-                    upstream_base_url=base_url,
-                    upstream_status=upstream["status"],
-                )
-                metrics.record_task_dispatched(worker_id=worker.id, backend=task.backend)
-                metrics.record_dispatch_duration(outcome="success", duration_ms=(time.perf_counter() - start) * 1000)
-                return True
             except Exception as exc:
                 payload.cleanup()
-                if should_retry(exc):
-                    excluded.add(worker.id)
-                    logger.warning("Dispatch to worker %s failed (infra): %s", worker.id, exc)
-                    reassigned = await self._reassign_dispatch_worker(task.task_id, excluded_ids=excluded)
-                    if reassigned is None:
-                        return False
-                    worker = reassigned
-                    continue
-                await self._mark_failed(task.task_id, error=f"Content error: {exc}")
-                metrics.record_dispatch_failed(error_class="content")
-                return False
+                outcome = await self._handle_dispatch_failure(task, worker, exc, excluded, start=start)
+                if isinstance(outcome, str):
+                    if outcome == "failed":
+                        metrics.record_dispatch_duration(
+                            outcome="failed", duration_ms=(time.perf_counter() - start) * 1000
+                        )
+                    return False
+                worker = outcome
+                continue
 
-    async def _reassign_dispatch_worker(self, task_id: str, *, excluded_ids: set[str]) -> Worker | None:
+            payload.cleanup()
+            await self._mark_processing(
+                task.task_id,
+                worker_id=worker.id,
+                upstream_task_id=upstream["task_id"],
+                upstream_base_url=base_url,
+                upstream_status=upstream["status"],
+            )
+            duration_ms = (time.perf_counter() - start) * 1000
+            metrics.record_task_dispatched(worker_id=worker.id, backend=task.backend)
+            metrics.record_dispatch_duration(outcome="success", duration_ms=duration_ms)
+            logger.info(
+                "Dispatched task=%s worker=%s upstream=%s backend=%s duration_ms=%.0f",
+                task.task_id,
+                worker.id,
+                upstream["task_id"],
+                task.backend,
+                duration_ms,
+            )
+            return True
+
+    async def _reassign_after_exclusion(
+        self, task: Task, worker: Worker, excluded: set[str], *, start: float
+    ) -> Worker | None:
+        """Exclude ``worker`` and acquire a replacement; returns None when no worker is available."""
+        excluded.add(worker.id)
+        return await self._reassign_dispatch_worker(task.task_id, excluded_ids=excluded, start=start)
+
+    async def _handle_dispatch_failure(
+        self, task: Task, worker: Worker, exc: Exception, excluded: set[str], *, start: float
+    ) -> _DispatchFailureOutcome:
+        """Process a dispatch exception: reassign on retryable infra errors, mark failed otherwise.
+
+        Returns a replacement ``Worker`` to retry with, ``"requeued"`` when the task was returned to
+        the queue, or ``"failed"`` when the task is terminal (content error).
+        """
+        if should_retry(exc):
+            logger.warning(
+                "Dispatch to worker %s failed (infra): task=%s error_class=%s error=%s",
+                worker.id,
+                task.task_id,
+                classify_error(exc).value,
+                exc,
+            )
+            metrics.record_dispatch_failed(error_class="infra")
+            reassigned = await self._reassign_after_exclusion(task, worker, excluded, start=start)
+            if reassigned is None:
+                return "requeued"
+            return reassigned
+        logger.warning("Task failed at dispatch task=%s reason=content_error error=%s", task.task_id, exc)
+        await self._mark_failed(task.task_id, error=f"Content error: {exc}")
+        metrics.record_dispatch_failed(error_class="content")
+        return "failed"
+
+    async def _reassign_dispatch_worker(self, task_id: str, *, excluded_ids: set[str], start: float) -> Worker | None:
         async with get_db_session() as session:
             row = await session.get(Task, task_id)
             if row is None or row.status != TASK_DISPATCHING:
@@ -266,6 +316,9 @@ class TaskRepository:
                 row.dispatch_started_at = None
                 row.worker_id = None
                 await session.commit()
+                logger.warning("Dispatch re-queued task=%s excluded_workers=%d", task_id, len(excluded_ids))
+                metrics.record_dispatch_requeued()
+                metrics.record_dispatch_duration(outcome="requeued", duration_ms=(time.perf_counter() - start) * 1000)
                 return None
             row.worker_id = worker.id
             await session.commit()
@@ -358,7 +411,7 @@ class TaskRepository:
             row.next_poll_at = now_utc() + timedelta(seconds=_POLL_RETRY_DELAY_SECONDS)
             await session.commit()
 
-    def _pollable_clause(self):
+    def _pollable_clause(self) -> ColumnElement[bool]:
         now = now_utc()
         return or_(Task.next_poll_at.is_(None), Task.next_poll_at <= now)
 
@@ -371,14 +424,12 @@ class TaskRepository:
             return row
         if not row.upstream_task_id or not row.upstream_base_url:
             return row
-        try:
-            resp = await self._require_client().get(
-                f"{row.upstream_base_url}/tasks/{row.upstream_task_id}", timeout=httpx.Timeout(10.0)
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.debug("Upstream status refresh failed for task %s: %s", task_id, exc)
+        payload = await worker_json_get(
+            self._require_client(),
+            f"{row.upstream_base_url}/tasks/{row.upstream_task_id}",
+            timeout=UPSTREAM_REFRESH_TIMEOUT,
+        )
+        if payload is None:
             await self.defer_task_poll(task_id)
             return row
         updated = await self.apply_upstream_payload(task_id, payload)
@@ -460,7 +511,7 @@ class TaskRepository:
                         client=self._require_client(),
                         cache_service=cache_service,
                         task_repository=self,
-                        timeout=_RESULT_FETCH_TIMEOUT_SECONDS,
+                        timeout=RESULT_FETCH_TIMEOUT_SECONDS,
                     )
                     stored += 1
                 except Exception as exc:
@@ -476,9 +527,7 @@ class TaskRepository:
             query = (
                 select(Task)
                 .where(
-                    Task.status.in_(("completed", "failed", "expired")),
-                    Task.completed_at.isnot(None),
-                    Task.completed_at < cutoff,
+                    Task.status.in_(TASK_STATUSES_TERMINAL), Task.completed_at.isnot(None), Task.completed_at < cutoff
                 )
                 .order_by(Task.completed_at.asc())
                 .limit(limit)

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+
+from mineru_gateway.cloud.base import CloudStorageProvider
+
+logger = logging.getLogger(__name__)
+
 PAYLOAD_PREFIX = "payloads"
 RESULT_PREFIX = "results"
 CACHE_PREFIX = "cache"
@@ -25,3 +31,29 @@ def cache_object_key(cache_key: str, *, generation: str | None = None) -> str:
     if generation:
         return f"{base}/{generation}"
     return base
+
+
+def task_status_url(task_id: str) -> str:
+    """Canonical relative status URL for a task (``/tasks/{id}``)."""
+    return f"/tasks/{task_id}"
+
+
+def task_result_url(task_id: str) -> str:
+    """Canonical relative result URL for a task (``/tasks/{id}/result``)."""
+    return f"/tasks/{task_id}/result"
+
+
+async def safe_delete(store: CloudStorageProvider, key: str | None, *, label: str) -> bool:
+    """Best-effort object delete; logs and returns False on failure. No-op on None/empty key.
+
+    Used for orphan cleanup (payloads, results, cache objects) where a delete failure must not
+    abort the caller. ``label`` identifies the object class in the log line.
+    """
+    if not key:
+        return True
+    try:
+        await store.delete(key)
+        return True
+    except Exception:
+        logger.exception("Failed to delete orphan %s %s", label, key)
+        return False

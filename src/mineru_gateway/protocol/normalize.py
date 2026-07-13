@@ -45,46 +45,43 @@ def normalize_middle_json(middle: dict[str, Any]) -> list[OCRPage]:
 
     Robust to missing fields — a page with no recognizable blocks still yields a page with empty markdown.
     """
-    pages: list[OCRPage] = []
     pdf_info = middle.get("pdf_info") or middle.get("_pdf_info") or []
+    return [_normalize_page(page, page_idx) for page_idx, page in enumerate(pdf_info)]
 
-    for page_idx, page in enumerate(pdf_info):
-        if isinstance(page, dict):
-            idx = page.get("page_idx", page_idx)
-            page_size = page.get("page_size") or page.get("size") or [0, 0]
-        else:
-            idx = page_idx
-            page_size = [0, 0]
 
-        dims = None
-        if isinstance(page_size, (list, tuple)) and len(page_size) >= 2:
-            dims = {"dpi": 72, "width": int(page_size[0]), "height": int(page_size[1])}
+def _normalize_page(page: Any, page_idx: int) -> OCRPage:
+    """Convert one MinerU page dict into an :class:`OCRPage`."""
+    if isinstance(page, dict):
+        idx = page.get("page_idx", page_idx)
+        page_size = page.get("page_size") or page.get("size") or [0, 0]
+    else:
+        idx = page_idx
+        page_size = [0, 0]
 
-        md_parts: list[str] = []
-        images: list[OCRPageImage] = []
+    dims = None
+    if isinstance(page_size, (list, tuple)) and len(page_size) >= 2:
+        dims = {"dpi": 72, "width": int(page_size[0]), "height": int(page_size[1])}
 
-        blocks = page.get("blocks") or page.get("para_blocks") or [] if isinstance(page, dict) else []
-        for block in blocks:
-            btype = block.get("type", "")
-            text = _extract_block_text(block)
-            if text:
-                if btype in ("table", "image", "figure"):
-                    md_parts.append(f"\n\n{text}\n\n")
-                else:
-                    md_parts.append(text)
+    md_parts: list[str] = []
+    images: list[OCRPageImage] = []
 
-            if btype in ("image", "figure") and include_images(block):
-                img = _extract_image(block, len(images))
-                if img:
-                    images.append(img)
+    blocks = page.get("blocks") or page.get("para_blocks") or [] if isinstance(page, dict) else []
+    for block in blocks:
+        btype = block.get("type", "")
+        text = _extract_block_text(block)
+        if text:
+            if btype in ("table", "image", "figure"):
+                md_parts.append(f"\n\n{text}\n\n")
+            else:
+                md_parts.append(text)
 
-        markdown = " ".join(md_parts).strip() if md_parts else ""
-        if not markdown:
-            markdown = ""
+        if btype in ("image", "figure") and include_images(block):
+            img = _extract_image(block, len(images))
+            if img:
+                images.append(img)
 
-        pages.append(OCRPage(index=int(idx), markdown=markdown, images=images, dimensions=dims))
-
-    return pages
+    markdown = " ".join(md_parts).strip() if md_parts else ""
+    return OCRPage(index=int(idx), markdown=markdown, images=images, dimensions=dims)
 
 
 def normalize_markdown(markdown: str) -> list[OCRPage]:

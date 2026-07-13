@@ -8,11 +8,11 @@ import logging
 import click
 import httpx
 
+from mineru_gateway.cli import load_settings_from_cli
 from mineru_gateway.cloud.registry import init_provider, init_store
-from mineru_gateway.config import load_settings, reset_settings_cache
 from mineru_gateway.db.base import init_engine, shutdown_engine
-from mineru_gateway.logging_config import configure_logging
 from mineru_gateway.observability.otel import init_otel
+from mineru_gateway.scheduler._http import SCHEDULER_CLIENT_TIMEOUT
 from mineru_gateway.scheduler.lock import scheduler_lock
 from mineru_gateway.scheduler.scheduler import Scheduler
 from mineru_gateway.startup_guard import validate_startup_dependencies
@@ -29,16 +29,9 @@ logger = logging.getLogger(__name__)
 )
 def main(config_path: str, database_url: str | None, log_level: str | None) -> None:
     """Run the mineru-gateway scheduler process (single sequential tick loop)."""
-    reset_settings_cache()
-    cli_overrides: dict[str, object] = {}
-    if database_url:
-        cli_overrides["database_url"] = database_url
-    if log_level:
-        cli_overrides["log_level"] = log_level
-    settings = load_settings(config_path, **cli_overrides)
-
-    resolved_level = log_level or settings.log_level
-    configure_logging(resolved_level)
+    settings, resolved_level = load_settings_from_cli(
+        config_path=config_path, database_url=database_url, log_level=log_level
+    )
     logger.info("Starting scheduler process (log_level=%s)", resolved_level.upper())
 
     asyncio.run(_run_scheduler(settings))
@@ -56,7 +49,7 @@ async def _run_scheduler(settings) -> None:
     provider = init_provider(settings)
     if settings.cloud_workers_enabled and provider is None:
         raise RuntimeError("Cloud workers enabled but compute provider failed to initialize")
-    client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+    client = httpx.AsyncClient(timeout=SCHEDULER_CLIENT_TIMEOUT)
 
     try:
         async with scheduler_lock(settings.database_url) as lock:

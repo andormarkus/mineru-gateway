@@ -12,6 +12,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 from mineru_gateway.db.base import Base
+from mineru_gateway.tasks.status import TASK_QUEUED
 
 
 def _utcnow() -> datetime:
@@ -74,7 +75,7 @@ class Task(Base):
     file_names: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     source: Mapped[str] = mapped_column(String(16), default="tasks", nullable=False)
 
-    status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), default=TASK_QUEUED, nullable=False, index=True)
     payload_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     result_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     result_format: Mapped[str | None] = mapped_column(String(16), nullable=True)

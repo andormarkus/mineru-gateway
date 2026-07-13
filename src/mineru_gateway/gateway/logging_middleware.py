@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log inbound HTTP requests at DEBUG/INFO/WARNING based on method and status."""
 
-    async def dispatch(self, request: Request, call_next) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         start = time.perf_counter()
         method = request.method
         path = request.url.path

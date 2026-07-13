@@ -18,6 +18,9 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 
 DEFAULT_CONFIG_PATH = "config.yaml"
 
+# Fixed upper bound for accepted uploads (1 GiB). Not configurable.
+MAX_FILE_SIZE_HARD_BYTES = 1024 * 1024 * 1024
+
 _cached_settings: GatewaySettings | None = None
 
 CloudProviderName = Literal["aws"]
@@ -37,7 +40,6 @@ class AwsCloudConfig(BaseModel):
     bucket: str = "mineru-results"
     endpoint_url: str | None = None  # S3/SeaweedFS dev/test; None → AWS S3
     ec2_endpoint_url: str | None = None  # EC2 moto/dev; None → AWS EC2
-    multipart_part_size_bytes: int = 8 * 1024 * 1024
 
 
 class ScalingConfig(BaseModel):
@@ -261,6 +263,10 @@ class GatewaySettings(BaseSettings):
     def _validate_deployment_and_cloud(self) -> GatewaySettings:
         if not self.deployment_id.strip():
             raise ValueError("deployment_id is required")
+        if self.max_file_size_bytes < 0:
+            raise ValueError("max_file_size_bytes must be >= 0")
+        if self.max_file_size_bytes > MAX_FILE_SIZE_HARD_BYTES:
+            raise ValueError(f"max_file_size_bytes cannot exceed hard limit of {MAX_FILE_SIZE_HARD_BYTES}")
         if self.cloud_workers_enabled and self.cloud.provider == "aws" and not self.cloud.aws.launch_template_id:
             raise ValueError("cloud.aws.launch_template_id is required when cloud workers are enabled")
         bucket = self.cloud.object_store_bucket()

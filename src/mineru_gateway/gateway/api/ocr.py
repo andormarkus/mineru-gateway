@@ -20,12 +20,10 @@ from fastapi.responses import JSONResponse
 from mineru_gateway.gateway.admission import check_admission
 from mineru_gateway.gateway.ingest import _should_skip_cache, build_payload, extract_document, ingest_payload
 from mineru_gateway.gateway.task_flow import (
-    client_sla_expired_response,
     fetch_result_or_none,
-    get_store,
-    is_poll_complete,
     poll_task_until_terminal,
-    try_fetch_result_bytes,
+    require_store,
+    resolve_sync_result,
 )
 from mineru_gateway.protocol.normalize import normalize_result
 from mineru_gateway.protocol.ocr_models import OCRRequest
@@ -54,13 +52,9 @@ async def create_ocr(request: Request, body: OCRRequest) -> JSONResponse:
             status_code=400, content={"detail": "Could not extract document. Provide document_url, image_url, or file."}
         )
 
-    store = get_store(request)
-    if store is None:
-        logger.error("OCR request rejected: object store not configured")
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Object store not configured — /v1/ocr requires durable result storage."},
-        )
+    store = require_store(request, detail="Object store not configured — /v1/ocr requires durable result storage.")
+    if isinstance(store, JSONResponse):
+        return store
 
     try:
         payload = build_payload(file_bytes=file_bytes, file_name=file_name, body=body)
@@ -92,31 +86,10 @@ async def create_ocr(request: Request, body: OCRRequest) -> JSONResponse:
 
     # Poll the DB until the scheduler dispatches the task and it reaches a terminal state.
     row = await poll_task_until_terminal(result.task_id, route="ocr")
-    if row is None:
-        logger.warning("OCR failed for task %s: task disappeared", result.task_id)
-        return JSONResponse(status_code=409, content={"detail": "OCR processing failed", "error": "task disappeared"})
-    if row.status in ("failed", "expired"):
-        logger.warning("OCR failed for task %s: %s", result.task_id, row.error)
-        return JSONResponse(status_code=409, content={"detail": "OCR processing failed", "error": row.error})
-
-    data = await try_fetch_result_bytes(result.task_id, row, store)
-    if data is not None:
-        logger.info("OCR completed for task %s (%d bytes)", result.task_id, len(data))
-        return _ocr_response(body, data)
-
-    if row.client_expired_at is not None:
-        logger.info("OCR client SLA expired for task %s (status=%s)", result.task_id, row.status)
-        return client_sla_expired_response(result.task_id, status=row.status)
-
-    if not is_poll_complete(row):
-        logger.warning("OCR timed out for task %s (status=%s)", result.task_id, row.status)
-        return JSONResponse(
-            status_code=202,
-            content={"task_id": result.task_id, "status": row.status, "message": "OCR result is not ready yet"},
-        )
-
-    logger.warning("OCR completed for task %s but result not in object store", result.task_id)
-    return JSONResponse(status_code=404, content={"detail": "Result not yet stored"})
+    resolved = await resolve_sync_result(task_id=result.task_id, row=row, store=store, route="ocr")
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    return _ocr_response(body, resolved)
 
 
 def _ocr_response(body: OCRRequest, result_bytes: bytes) -> JSONResponse:

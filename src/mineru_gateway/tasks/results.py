@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from mineru_gateway.cloud.base import CloudStorageProvider
-from mineru_gateway.tasks.storage import RESULT_FORMAT_ZIP, result_key
+from mineru_gateway.tasks.storage import RESULT_FORMAT_ZIP, result_key, safe_delete
 
 if TYPE_CHECKING:
     from mineru_gateway.scheduler.cache_service import CacheService
@@ -48,17 +48,8 @@ async def fetch_and_store_result(
         cache_key = await task_repository.complete_with_result(
             task_id, result_key_value=key, result_format=RESULT_FORMAT_ZIP
         )
-    except KeyError:
-        try:
-            await store.delete(key)
-        except Exception:
-            logger.exception("Failed to delete orphan result object %s", key)
-        raise
     except Exception:
-        try:
-            await store.delete(key)
-        except Exception:
-            logger.exception("Failed to delete orphan result object %s", key)
+        await safe_delete(store, key, label="result object")
         raise
 
     if cache_service is not None and cache_key:

@@ -23,6 +23,11 @@ def test_metrics_noop_when_disabled() -> None:
     m.record_health_check(outcome="healthy")
     m.record_poll_duration(route="ocr", outcome="completed", duration_ms=100.0)
     m.record_retention_deleted(kind="task")
+    m.record_worker_scaled(action="start")
+    m.record_cloud_error(category="retryable", retryable=True)
+    m.record_cache_sweep_removed(3)
+    m.record_dispatch_requeued()
+    m.record_stale_claims_recovered(2)
 
 
 def test_module_singleton_is_noop_by_default() -> None:
