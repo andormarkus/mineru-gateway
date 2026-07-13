@@ -9,6 +9,7 @@ from mineru_gateway.cloud.aws.ec2 import AwsEc2Provider
 from mineru_gateway.cloud.aws.s3 import S3ObjectStore
 from mineru_gateway.cloud.base import CloudStorageProvider, ComputeProvider
 from mineru_gateway.config import GatewaySettings
+from mineru_gateway.startup_guard import StartupDependencyError
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +27,7 @@ _COMPUTE_FACTORIES: dict[str, ProviderFactory] = {
 
 _STORE_FACTORIES: dict[str, StoreFactory] = {
     "aws": lambda settings: S3ObjectStore(
-        bucket=settings.cloud.aws.bucket,
-        endpoint_url=settings.cloud.aws.endpoint_url,
-        region=settings.cloud.aws.region,
-        multipart_part_size_bytes=settings.cloud.aws.multipart_part_size_bytes,
+        bucket=settings.cloud.aws.bucket, endpoint_url=settings.cloud.aws.endpoint_url, region=settings.cloud.aws.region
     )
 }
 
@@ -78,7 +76,7 @@ async def init_store(settings: GatewaySettings, *, required: bool = True) -> Clo
     cloud = settings.cloud
     if not cloud.is_object_store_configured():
         if required:
-            raise RuntimeError(f"cloud.{cloud.provider} bucket/container name is required")
+            raise StartupDependencyError(f"cloud.{cloud.provider} bucket/container name is required")
         return None
     store = get_store(cloud.provider, settings=settings)
     await store.prepare()

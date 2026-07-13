@@ -21,18 +21,12 @@ class InMemoryStore(CloudStorageProvider):
     async def put(
         self,
         key: str,
-        data: bytes | AsyncIterator[bytes],
+        data: bytes,
         *,
         content_type: str = "application/octet-stream",
         metadata: dict[str, str] | None = None,
     ) -> int:
-        if isinstance(data, (bytes, bytearray)):
-            self._data[key] = bytes(data)
-        else:
-            body = b""
-            async for chunk in data:
-                body += chunk
-            self._data[key] = body
+        self._data[key] = bytes(data)
         return len(self._data[key])
 
     async def get(self, key: str) -> bytes:

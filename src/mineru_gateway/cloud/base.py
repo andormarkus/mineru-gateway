@@ -66,7 +66,7 @@ class CloudStorageProvider(ABC):
     async def put(
         self,
         key: str,
-        data: bytes | AsyncIterator[bytes],
+        data: bytes,
         *,
         content_type: str = "application/octet-stream",
         metadata: dict[str, str] | None = None,

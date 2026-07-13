@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from mineru_gateway.cloud.aws.ec2 import AwsEc2Provider, _classify_ec2_error, _normalize_ec2_state
+from mineru_gateway.cloud.aws.ec2 import AwsEc2Provider
 from mineru_gateway.cloud.errors import CloudError, CloudErrorCategory
 from mineru_gateway.cloud.types import (
     TAG_DEPLOYMENT,
@@ -180,23 +180,23 @@ async def test_get_state_unknown(ec2_provider: AwsEc2Provider) -> None:
 
 
 def test_normalize_ec2_state_mapping() -> None:
-    assert _normalize_ec2_state("running") == InstanceState.RUNNING
-    assert _normalize_ec2_state("stopped") == InstanceState.SUSPENDED
-    assert _normalize_ec2_state("pending") == InstanceState.STARTING
-    assert _normalize_ec2_state("terminated") == InstanceState.TERMINATED
-    assert _normalize_ec2_state("weird-state") == InstanceState.UNKNOWN
+    assert AwsEc2Provider._normalize_ec2_state("running") == InstanceState.RUNNING
+    assert AwsEc2Provider._normalize_ec2_state("stopped") == InstanceState.SUSPENDED
+    assert AwsEc2Provider._normalize_ec2_state("pending") == InstanceState.STARTING
+    assert AwsEc2Provider._normalize_ec2_state("terminated") == InstanceState.TERMINATED
+    assert AwsEc2Provider._normalize_ec2_state("weird-state") == InstanceState.UNKNOWN
 
 
 def test_classify_ec2_error_by_code() -> None:
     from botocore.exceptions import ClientError
 
     exc = ClientError({"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}}, "RunInstances")
-    err = _classify_ec2_error(exc)
+    err = AwsEc2Provider._classify_ec2_error(exc)
     assert isinstance(err, CloudError)
     assert err.category == CloudErrorCategory.AUTH
     assert err.code == "UnauthorizedOperation"
 
     exc = ClientError({"Error": {"Code": "Throttling", "Message": "slow down"}}, "StartInstances")
-    err = _classify_ec2_error(exc)
+    err = AwsEc2Provider._classify_ec2_error(exc)
     assert err.category == CloudErrorCategory.RETRYABLE
     assert err.retryable is True

@@ -51,35 +51,6 @@ _EC2_ERROR_CLASSIFICATION: dict[str, tuple[CloudErrorCategory, bool]] = {
 }
 
 
-def _ec2_error_code(exc: ClientError) -> str:
-    return exc.response.get("Error", {}).get("Code", "")
-
-
-def _classify_ec2_error(exc: ClientError) -> CloudError:
-    code = _ec2_error_code(exc)
-    message = exc.response.get("Error", {}).get("Message", str(exc))
-    category, retryable = _EC2_ERROR_CLASSIFICATION.get(code, (CloudErrorCategory.UNKNOWN, False))
-    return CloudError(category=category, code=code, message=message, retryable=retryable)
-
-
-def _raise_ec2_error(exc: ClientError) -> NoReturn:
-    raise _classify_ec2_error(exc) from exc
-
-
-def _normalize_ec2_state(vendor_state: str) -> InstanceState:
-    return _EC2_STATE_MAP.get(vendor_state, InstanceState.UNKNOWN)
-
-
-def _tags_to_specifications(tags: dict[str, str]) -> list[dict[str, Any]]:
-    if not tags:
-        return []
-    return [{"ResourceType": "instance", "Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}]
-
-
-def _tags_from_instance(instance: dict[str, Any]) -> dict[str, str]:
-    return {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}
-
-
 class AwsEc2Provider(ComputeProvider):
     """EC2-backed worker lifecycle via aioboto3."""
 
@@ -109,10 +80,10 @@ class AwsEc2Provider(ComputeProvider):
             try:
                 describe_resp = await ec2.describe_instances(InstanceIds=[instance_id])
             except ClientError as exc:
-                code = _ec2_error_code(exc)
+                code = self._ec2_error_code(exc)
                 if code in {"InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed", "InvalidInstanceID"}:
                     return None
-                _raise_ec2_error(exc)
+                self._raise_ec2_error(exc)
             reservations = describe_resp.get("Reservations", [])
         if not reservations or not reservations[0].get("Instances"):
             return None
@@ -126,9 +97,9 @@ class AwsEc2Provider(ComputeProvider):
             async with self._client() as ec2:
                 await ec2.start_instances(InstanceIds=[instance_id])
         except ClientError as exc:
-            if _ec2_error_code(exc) == "IncorrectInstanceState":
+            if self._ec2_error_code(exc) == "IncorrectInstanceState":
                 return
-            _raise_ec2_error(exc)
+            self._raise_ec2_error(exc)
 
     async def stop(self, instance_id: str) -> None:
         state = await self.get_state(instance_id)
@@ -138,9 +109,9 @@ class AwsEc2Provider(ComputeProvider):
             async with self._client() as ec2:
                 await ec2.stop_instances(InstanceIds=[instance_id], Force=False)
         except ClientError as exc:
-            if _ec2_error_code(exc) == "IncorrectInstanceState":
+            if self._ec2_error_code(exc) == "IncorrectInstanceState":
                 return
-            _raise_ec2_error(exc)
+            self._raise_ec2_error(exc)
 
     async def launch(self, worker_id: str, *, deployment_id: str, generation: int) -> str:
         if self._cloud is None:
@@ -169,14 +140,14 @@ class AwsEc2Provider(ComputeProvider):
             "MinCount": 1,
             "LaunchTemplate": launch_template,
             "ClientToken": worker_id,
-            "TagSpecifications": _tags_to_specifications(tags),
+            "TagSpecifications": self._tags_to_specifications(tags),
         }
 
         async with self._client() as ec2:
             try:
                 launch_resp = await ec2.run_instances(**params)
             except ClientError as exc:
-                _raise_ec2_error(exc)
+                self._raise_ec2_error(exc)
             instance_id = launch_resp["Instances"][0]["InstanceId"]
 
         logger.info("EC2 launch: instance_id=%s worker_id=%s", instance_id, worker_id)
@@ -190,18 +161,18 @@ class AwsEc2Provider(ComputeProvider):
             async with self._client() as ec2:
                 await ec2.terminate_instances(InstanceIds=[instance_id])
         except ClientError as exc:
-            code = _ec2_error_code(exc)
+            code = self._ec2_error_code(exc)
             if code in {"InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed", "InvalidInstanceID"}:
                 return
             if code == "IncorrectInstanceState":
                 return
-            _raise_ec2_error(exc)
+            self._raise_ec2_error(exc)
 
     async def get_state(self, instance_id: str) -> InstanceState:
         instance = await self._describe_instance(instance_id)
         if instance is None:
             return InstanceState.TERMINATED
-        return _normalize_ec2_state(instance["State"]["Name"])
+        return self._normalize_ec2_state(instance["State"]["Name"])
 
     async def get_private_ip(self, instance_id: str) -> str | None:
         instance = await self._describe_instance(instance_id)
@@ -222,15 +193,44 @@ class AwsEc2Provider(ComputeProvider):
                 async for page in paginator.paginate(Filters=filters):
                     for reservation in page.get("Reservations", []):
                         for instance in reservation.get("Instances", []):
-                            tags = _tags_from_instance(instance)
+                            tags = self._tags_from_instance(instance)
                             discovered.append(
                                 DiscoveredInstance(
                                     instance_id=instance["InstanceId"],
                                     worker_id=tags.get(TAG_WORKER_ID),
-                                    state=_normalize_ec2_state(instance["State"]["Name"]),
+                                    state=self._normalize_ec2_state(instance["State"]["Name"]),
                                     tags=tags,
                                 )
                             )
         except ClientError as exc:
-            _raise_ec2_error(exc)
+            self._raise_ec2_error(exc)
         return discovered
+
+    @staticmethod
+    def _ec2_error_code(exc: ClientError) -> str:
+        return exc.response.get("Error", {}).get("Code", "")
+
+    @staticmethod
+    def _classify_ec2_error(exc: ClientError) -> CloudError:
+        code = AwsEc2Provider._ec2_error_code(exc)
+        message = exc.response.get("Error", {}).get("Message", str(exc))
+        category, retryable = _EC2_ERROR_CLASSIFICATION.get(code, (CloudErrorCategory.UNKNOWN, False))
+        return CloudError(category=category, code=code, message=message, retryable=retryable)
+
+    @staticmethod
+    def _raise_ec2_error(exc: ClientError) -> NoReturn:
+        raise AwsEc2Provider._classify_ec2_error(exc) from exc
+
+    @staticmethod
+    def _normalize_ec2_state(vendor_state: str) -> InstanceState:
+        return _EC2_STATE_MAP.get(vendor_state, InstanceState.UNKNOWN)
+
+    @staticmethod
+    def _tags_to_specifications(tags: dict[str, str]) -> list[dict[str, Any]]:
+        if not tags:
+            return []
+        return [{"ResourceType": "instance", "Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}]
+
+    @staticmethod
+    def _tags_from_instance(instance: dict[str, Any]) -> dict[str, str]:
+        return {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}

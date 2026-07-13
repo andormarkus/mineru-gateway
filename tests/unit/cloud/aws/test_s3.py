@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock
 
 import pytest
 from botocore.exceptions import ClientError
 
-from mineru_gateway.cloud.aws.s3 import S3ObjectStore, _classify_s3_prepare_error
+from mineru_gateway.cloud.aws.s3 import S3ObjectStore
 from mineru_gateway.cloud.errors import CloudError, CloudErrorCategory
 
 
@@ -54,7 +53,7 @@ async def test_prepare_missing_bucket_raises(s3_store: S3ObjectStore) -> None:
 
 def test_prepare_403_is_auth_error() -> None:
     exc = ClientError({"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadBucket")
-    err = _classify_s3_prepare_error(exc)
+    err = S3ObjectStore._classify_s3_prepare_error(exc)
     assert err.category == CloudErrorCategory.AUTH
 
 
@@ -74,57 +73,6 @@ async def test_put_get_delete_roundtrip(s3_store: S3ObjectStore, moto_s3_endpoin
 
     await s3_store.delete("obj-key")
     assert not await s3_store.exists("obj-key")
-
-
-@pytest.mark.asyncio
-async def test_put_async_iterator_uses_multipart(s3_store: S3ObjectStore, moto_s3_endpoint: str) -> None:
-    _create_s3_bucket(moto_s3_endpoint, "unit-test-bucket")
-    await s3_store.prepare()
-
-    async def chunks() -> AsyncIterator[bytes]:
-        yield b"part-a"
-        yield b"part-b"
-
-    nbytes = await s3_store.put("stream-put", chunks())
-    assert nbytes == 12
-    assert await s3_store.get("stream-put") == b"part-apart-b"
-
-
-@pytest.mark.asyncio
-async def test_multipart_abort_on_failure(s3_store: S3ObjectStore, moto_s3_endpoint: str) -> None:
-    _create_s3_bucket(moto_s3_endpoint, "unit-test-bucket")
-    await s3_store.prepare()
-
-    abort_mock = AsyncMock()
-    upload_part_mock = AsyncMock(side_effect=ClientError({"Error": {"Code": "500", "Message": "fail"}}, "UploadPart"))
-
-    async def failing_chunks() -> AsyncIterator[bytes]:
-        yield b"x" * (8 * 1024 * 1024 + 1)
-
-    original_client = s3_store._client
-
-    class FakeS3:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        create_multipart_upload = AsyncMock(return_value={"UploadId": "upload-1"})
-        upload_part = upload_part_mock
-        abort_multipart_upload = abort_mock
-        put_object = AsyncMock()
-
-    def fake_client():
-        return FakeS3()
-
-    s3_store._client = fake_client  # type: ignore[method-assign]
-    try:
-        with pytest.raises(ClientError):
-            await s3_store.put("broken-stream", failing_chunks())
-        abort_mock.assert_awaited_once()
-    finally:
-        s3_store._client = original_client  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio
