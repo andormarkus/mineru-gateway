@@ -80,6 +80,7 @@ def _apply_slow_test_env(
     """Configure gateway for local sqlite + SeaweedFS; disable EC2 autoscaling."""
     monkeypatch.setenv("MINERU_GATEWAY_DATABASE_URL", database_url)
     monkeypatch.setenv("MINERU_GATEWAY_CLOUD_WORKERS_ENABLED", "false")
+    monkeypatch.setenv("MINERU_GATEWAY_AUTH__ENABLED", "false")
     monkeypatch.setenv("MINERU_GATEWAY_CLOUD__AWS__ENDPOINT_URL", s3_endpoint)
     monkeypatch.setenv("MINERU_GATEWAY_CLOUD__AWS__BUCKET", s3_bucket)
     monkeypatch.setenv("MINERU_GATEWAY_SCALING__MIN_WORKERS", "0")

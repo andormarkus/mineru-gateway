@@ -44,9 +44,15 @@ def _env_float(name: str, default: float) -> float:
 
 
 def e2e_aws_configured() -> bool:
-    """True when real EC2 E2E prerequisites are present in the environment."""
+    """True when real EC2 E2E prerequisites are present in the environment.
+
+    Beyond launch template + bucket, ``MINERU_GATEWAY_E2E=1`` must be set
+    explicitly: these tests launch real GPU instances and cost money, so a
+    shell that merely still exports the cloud config must never trip them.
+    """
     return bool(
-        os.environ.get("MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_ID", "").strip()
+        os.environ.get("MINERU_GATEWAY_E2E", "").strip() == "1"
+        and os.environ.get("MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_ID", "").strip()
         and os.environ.get("MINERU_GATEWAY_CLOUD__AWS__BUCKET", "").strip()
     )
 
@@ -280,6 +286,8 @@ async def wait_for_workers_gone(
 
 
 def require_e2e_cloud_config(*, database_url: str) -> E2eCloudConfig:
+    if os.environ.get("MINERU_GATEWAY_E2E", "").strip() != "1":
+        pytest.skip("EC2 E2E launches real GPU instances (costs money) — set MINERU_GATEWAY_E2E=1 to opt in")
     cfg = load_e2e_cloud_config(database_url=database_url)
     if cfg is None:
         pytest.skip(

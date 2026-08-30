@@ -50,7 +50,7 @@ tasks:
       - uv run pytest tests/unit -m "not integration and not slow"
 
   test-integration:
-    desc: Run integration tests (Docker required, testcontainers + SeaweedFS).
+    desc: Run integration tests against moto S3 (no Docker needed).
     cmds:
       - uv run pytest tests/integration -m "integration"
 
@@ -70,17 +70,23 @@ tasks:
       - uv run pytest tests/slow -m slow
 
   test-e2e:
-    desc: Run Tier-4 AWS EC2 E2E tests (launch template + bucket in env).
+    desc: Run Tier-4 AWS EC2 E2E tests (costs money — MINERU_GATEWAY_E2E=1 + launch template + bucket in env).
+    env:
+      MINERU_GATEWAY_E2E: "1"
     cmds:
       - uv run pytest tests/e2e -m e2e -s
 
   test-e2e-smoke:
-    desc: Quick AWS E2E smoke (one worker, one task).
+    desc: Quick AWS E2E smoke (one worker, one task; costs money).
+    env:
+      MINERU_GATEWAY_E2E: "1"
     cmds:
       - uv run pytest tests/e2e/test_cloud_ec2.py -m e2e -s
 
   test-e2e-scheduler:
     desc: Full AWS scheduler E2E (autoscale, rotation, drain) — slow, costs GPU time.
+    env:
+      MINERU_GATEWAY_E2E: "1"
     cmds:
       - uv run pytest tests/e2e/test_cloud_scheduler.py -m e2e -s
 

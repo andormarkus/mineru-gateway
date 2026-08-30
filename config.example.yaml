@@ -27,7 +27,11 @@ log_level: "INFO"
 # Soft upload limit in bytes (0 = only the 1 GiB hard cap applies). Cannot exceed the hard maximum.
 # Configure the reverse proxy or ingress with the same or smaller request-body limit so multipart
 # parsing cannot spool unbounded data before these checks run.
-max_file_size_bytes: 0
+max_file_size_bytes: 104857600    # 100 MiB
+
+# Cloud workers: true lets the scheduler launch/terminate EC2 GPU workers via the
+# launch template below. false = manually registered workers only (Tier-3 setups).
+cloud_workers_enabled: false
 
 scaling:
   # Target-tracking on queued/dispatching/processing tasks per serviceable worker.
@@ -37,10 +41,12 @@ scaling:
   idle_cooldown_seconds: 300      # stop a worker idle longer than this
   scale_up_cooldown_seconds: 60   # prevent thrash between scale-ups
 
-# Internal API key (required for non-probe endpoints in production).
+# Internal API key — required for all non-probe endpoints. The startup guard
+# refuses to bind on a public interface unless auth is enabled with a key.
+# Replace the placeholder with a real secret (e.g. `openssl rand -hex 32`).
 auth:
-  enabled: false
-  api_key: null
+  enabled: true
+  api_key: "change-me-openssl-rand-hex-32"
 
 scheduler:
   dispatch_poll_interval_seconds: 0.5
