@@ -53,6 +53,17 @@ Synchronous endpoints can stop waiting after their polling period and return HTT
 
 Scheduler-managed client SLA behavior is not required. Existing SLA code may be removed in a later focused simplification, but it is not a release blocker when it does not interrupt execution.
 
+## Scale-from-zero cold boot
+
+With `scaling.min_workers: 0` the first request after an idle drain pays the worker cold boot. The launch-template user-data builds the MinerU Docker image on first boot (tens of minutes); later boots of the same instance type are faster but still exceed the 300s synchronous SLA. Practical consequences:
+
+- synchronous endpoints (`/v1/ocr`, `/file_parse`) return `202 + task_id` while the worker boots;
+- the async `/tasks` flow is the primary interface for cold fleets;
+- cache hits return instantly regardless of fleet state;
+- `provisioning_detail` (admin workers API) shows the live bootstrap stage while a worker builds.
+
+Accepted for v1. A pinned/golden worker AMI is the eventual fix (see "Not doing" in `docs/ideas/ship-v1.md`).
+
 ## MinerU compatibility wrapper
 
 `mineru_compat.py` remains as the single location for imports tied to the supported MinerU version. It is intentionally retained and is not considered unnecessary architecture.

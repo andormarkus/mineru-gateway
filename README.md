@@ -252,9 +252,115 @@ cloud:
     bucket: mineru-results
     launch_template_id: lt-0abc123
     launch_template_version: "$Latest"
+    worker_address: private        # private (default) | public
 ```
 
-Worker VMs must run `mineru-api` (or equivalent) and register with the scheduler. The launch template should tag instances with the gateway's deployment identity.
+Workers are stock upstream `mineru-api` instances — nothing registers with the
+gateway. The scheduler launches them via the launch template, discovers them by
+deployment tags, health-checks `:8000`, polls `:8001` for bootstrap progress
+while they build, dispatches tasks, and terminates them when idle.
+
+Provision the worker infrastructure with the CloudFormation stacks in
+`deploy/cloudformation/`:
+
+| Template | Topology |
+|----------|----------|
+| `mineru-worker.yaml` | Workers in a **private subnet**, no public IPs. The gateway/scheduler SG gets access to `:8000`/`:8001`. |
+| `mineru-worker-public.yaml` | Workers with public IPs + CIDR allow-list. What the e2e tier runs against; useful when the scheduler runs outside the VPC. |
+| `gateway-host.yaml` | The host that runs gateway + scheduler + Postgres (see below). |
+
+### Sandbox deployment (SSM, closed topology)
+
+The v1 sandbox topology: everything private, zero inbound ports, operated via
+SSM Session Manager. The whole stack is repeatable — launch, deploy, iterate,
+remove.
+
+```
+ ┌───────────────────────────── VPC ─────────────────────────────┐
+ │ public subnet                      private subnet            │
+ │ ┌────────────────────┐             ┌───────────────────────┐  │
+ │ │ gateway host (t4g) │──8000/8001──▶ GPU workers (g5/g6)   │  │
+ │ │ gateway+scheduler  │             │ stock mineru-api      │  │
+ │ │ postgres (compose) │             │ scale 0..2, idle-drain│  │
+ │ └─────────┬──────────┘             └───────────┬───────────┘  │
+ │           │ no inbound SG                      │ S3           │
+ └───────────┼─────────────────────────────────────┼──────────────┘
+             │ SSM (outbound)                      │
+        operator laptop                       results bucket
+```
+
+**1 — Worker stack** (once per environment; needs the host SG for ingress, so
+create the host stack first and pass its `SecurityGroupId` output):
+
+```bash
+aws cloudformation create-stack --stack-name mineru-worker-sandbox \
+  --template-body file://deploy/cloudformation/mineru-worker.yaml \
+  --parameters \
+    ParameterKey=VpcId,ParameterValue=vpc-... \
+    ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
+    ParameterKey=GatewaySecurityGroupId,ParameterValue=<gateway-host SecurityGroupId> \
+    ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
+    ParameterKey=EnvironmentName,ParameterValue=sandbox \
+  --capabilities CAPABILITY_NAMED_IAM
+# Note the LaunchTemplateId output and the worker role ARN (behind
+# WorkerInstanceProfileArn) — both go into the host stack.
+```
+
+**2 — Host stack** (the SSM-operated dev machine; ~$0.04/hr t4g.medium):
+
+```bash
+aws cloudformation create-stack --stack-name mineru-gateway-host \
+  --template-body file://deploy/cloudformation/gateway-host.yaml \
+  --parameters \
+    ParameterKey=VpcId,ParameterValue=vpc-... \
+    ParameterKey=PublicSubnetId,ParameterValue=subnet-... \
+    ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
+    ParameterKey=WorkerRoleArn,ParameterValue=arn:aws:iam::...:role/sandbox-mineru-gateway-worker \
+    ParameterKey=EnvironmentName,ParameterValue=sandbox \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+**3 — Deploy the stack over SSM** (no SSH, no keys, no open ports):
+
+```bash
+HOST=$(aws cloudformation describe-stacks --stack-name mineru-gateway-host \
+  --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text)
+
+aws ssm send-command --instance-ids "$HOST" \
+  --document-name AWS-RunShellScript --comment "deploy mineru-gateway" \
+  --commands 'git clone https://github.com/andormarkus/mineru-gateway.git ~/mineru-gateway &&
+              cd ~/mineru-gateway && git checkout v0.1.0 &&
+              cd deploy/compose &&
+              cp .env.example .env && sed -i "s/change-me/$(openssl rand -hex 24)/" .env &&
+              cp config.sandbox.yaml.example config.yaml &&
+              docker compose -f docker-compose.sandbox.yml up -d --build'
+# then edit ~/mineru-gateway/deploy/compose/config.yaml on the host:
+#   api_key, bucket, launch_template_id, and the SAME postgres password as .env
+```
+
+**4 — Operate:**
+
+```bash
+aws ssm start-session --target "$HOST"    # interactive shell
+aws ssm start-session --target "$HOST" \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}'
+curl http://127.0.0.1:8000/health          # gateway through the tunnel
+```
+
+**5 — Remove the dev machine** (GPU workers drain to zero on their own via
+`idle_cooldown_seconds`; the host is the only fixed cost):
+
+```bash
+aws cloudformation delete-stack --stack-name mineru-gateway-host
+```
+
+**Scale-from-zero contract.** With `min_workers: 0` the fleet costs nothing
+idle, but the first request pays the worker cold boot — 10+ minutes on first
+launch (the user-data builds the MinerU image; later boots are faster). That
+outlasts the 300s sync-poll SLA: `/v1/ocr` and `/file_parse` return
+`202 + task_id` while execution continues, and callers should prefer the async
+`/tasks` flow. Cached documents return instantly regardless of fleet state.
 
 ## API reference (summary)
 
@@ -283,11 +389,19 @@ Full request/response schemas: `/docs` (Swagger UI) or `/openapi.json`.
 task install          # uv sync --all-extras
 task lint             # ruff check + format
 task typecheck        # pyright
-task test             # unit tests (no Docker)
-task test-integration # Docker: testcontainers + SeaweedFS
-task test-postgres    # PostgreSQL-specific tests
-task checks-full      # lint + typecheck + full test suite
+task checks           # lint + typecheck + unit + postgres (the pre-commit combo)
+task checks-full      # everything below except slow/e2e
 ```
+
+Test tiers (all skip cleanly when their prerequisites are missing):
+
+| Command | Tier | Requires |
+|---------|------|----------|
+| `task test` | Unit — FakeWorker, in-memory store | nothing |
+| `task test-integration` | Wired paths against moto S3 | nothing (no Docker) |
+| `task test-postgres` | Migrations + advisory lock | Docker (testcontainers) |
+| `task test-slow` | Real gateway ↔ real `mineru-api` worker | `task up` + `MINERU_TEST_WORKER_URL` |
+| `task test-e2e` | Real AWS EC2 — **costs money** | `MINERU_GATEWAY_E2E=1` + launch template + bucket env |
 
 Hot-reload dev server:
 
