@@ -43,6 +43,7 @@ class Worker(Base):
     retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     stalled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provisioning_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     start_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

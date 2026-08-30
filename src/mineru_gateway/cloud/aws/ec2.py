@@ -180,6 +180,12 @@ class AwsEc2Provider(ComputeProvider):
             return None
         return instance.get("PrivateIpAddress")
 
+    async def get_public_ip(self, instance_id: str) -> str | None:
+        instance = await self._describe_instance(instance_id)
+        if instance is None:
+            return None
+        return instance.get("PublicIpAddress")
+
     async def discover(self, deployment_id: str) -> list[DiscoveredInstance]:
         filters = [
             {"Name": f"tag:{TAG_MANAGED}", "Values": ["true"]},

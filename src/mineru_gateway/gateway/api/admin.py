@@ -128,6 +128,7 @@ def _worker_dict(w: Worker) -> dict[str, Any]:
         "stalled_at": to_iso(w.stalled_at),
         "ready_at": to_iso(w.ready_at),
         "last_error": w.last_error,
+        "provisioning_detail": w.provisioning_detail,
         "last_active_at": to_iso(w.last_active_at),
         "terminated_at": to_iso(w.terminated_at),
         "created_at": to_iso(w.created_at),

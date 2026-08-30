@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
 import pytest
@@ -68,6 +69,32 @@ async def test_claim_skips_when_no_worker_available(db_session: AsyncSession) ->
     assert row is not None
     assert row.status == TASK_QUEUED
     assert row.worker_id is None
+
+
+@pytest.mark.asyncio
+async def test_claim_deferred_log_is_edge_triggered(db_session: AsyncSession, caplog: pytest.LogCaptureFixture) -> None:
+    db_session.add(
+        Task(task_id="queued-3", status=TASK_QUEUED, backend="pipeline", file_names=["doc.pdf"], payload_key="p3")
+    )
+    await db_session.commit()
+
+    repo = TaskRepository(get_settings(), InMemoryStore(), workers=WorkerRepository(get_settings()))
+
+    with caplog.at_level(logging.INFO):
+        assert await repo._claim_next_dispatch() is None
+        assert await repo._claim_next_dispatch() is None
+
+    deferred_logs = [r for r in caplog.records if "Dispatch deferred" in r.message]
+    assert len(deferred_logs) == 1
+
+    await _add_worker(db_session)
+
+    with caplog.at_level(logging.INFO):
+        claim = await repo._claim_next_dispatch()
+
+    assert claim is not None
+    resumed_logs = [r for r in caplog.records if "Dispatch resumed" in r.message]
+    assert len(resumed_logs) == 1
 
 
 @pytest.mark.asyncio

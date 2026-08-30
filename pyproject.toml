@@ -148,6 +148,7 @@ markers = [
     "integration: tests requiring Docker (testcontainers / SeaweedFS)",
     "postgres: tests requiring PostgreSQL (testcontainers or MINERU_GATEWAY_TEST_POSTGRES_URL)",
     "slow: tests requiring a real mineru-api worker (Tier-3, end-to-end)",
+    "e2e: tests requiring real AWS EC2 worker launch/stop (Tier-4, costs money)",
 ]
 filterwarnings = [
     "error",

@@ -1,0 +1,484 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  mineru-gateway GPU worker infrastructure — launch template, IAM, security group.
+  Scheduler reaches workers at http://<private-ip>:8000/health and dispatches tasks.
+  Worker tags (mineru-gateway-*) are applied by the gateway at RunInstances, not here.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - PrivateSubnetId
+          - GatewaySecurityGroupId
+      - Label:
+          default: Worker instance
+        Parameters:
+          - InstanceType
+          - RootVolumeSizeGiB
+          - WorkerAmiId
+      - Label:
+          default: Storage
+        Parameters:
+          - ResultsBucket
+      - Label:
+          default: Naming
+        Parameters:
+          - EnvironmentName
+          - LaunchTemplateName
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where gateway scheduler and workers run (same VPC required).
+
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet for workers (needs NAT for first-boot Docker build).
+
+  GatewaySecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group of mineru-gateway / scheduler — allowed inbound on worker :8000.
+
+  InstanceType:
+    Type: String
+    Default: g6.2xlarge
+    AllowedValues:
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g5.xlarge
+      - g5.2xlarge
+      - g6.2xlarge
+      - g6.4xlarge
+      - p3.2xlarge
+    Description: GPU instance type (must match account quota).
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 200
+    MinValue: 100
+    MaxValue: 500
+    Description: Root EBS size (GB) for Docker image + baked models.
+
+  WorkerAmiId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional custom AMI (golden image after first bootstrap). Leave empty to use
+      latest AWS Deep Learning Base OSS Nvidia Driver GPU AMI (Amazon Linux 2023).
+
+  DeeplearningAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-amazon-linux-2023/latest/ami-id
+
+  EnvironmentName:
+    Type: String
+    Default: prod
+    Description: Prefix for resource names (e.g. prod, staging).
+
+  LaunchTemplateName:
+    Type: String
+    Default: mineru-gateway-worker
+    Description: EC2 launch template name (referenced in gateway config.yaml).
+
+  ResultsBucket:
+    Type: String
+    Description: >
+      S3 bucket for mineru-gateway payloads and results (must match cloud.aws.bucket in gateway config).
+
+Conditions:
+  UseCustomAmi: !Not [!Equals [!Ref WorkerAmiId, ""]]
+
+Resources:
+  WorkerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mineru-gateway-worker"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-worker-role"
+
+  WorkerS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: mineru-gateway-worker-s3
+      Roles:
+        - !Ref WorkerInstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ListBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !Sub "arn:aws:s3:::${ResultsBucket}"
+          - Sid: ObjectReadWrite
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub "arn:aws:s3:::${ResultsBucket}/*"
+
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-mineru-gateway-worker"
+      Roles:
+        - !Ref WorkerInstanceRole
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-mineru-gateway-worker"
+      GroupDescription: mineru-api workers - scheduler dispatch and health on TCP 8000
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Egress for Docker pulls and model downloads during bootstrap
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-worker"
+
+  WorkerSecurityGroupIngressFromGateway:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !Ref GatewaySecurityGroupId
+      Description: mineru-gateway scheduler to mineru-api on port 8000
+
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Ref LaunchTemplateName
+      VersionDescription: mineru-api hybrid-auto-engine on port 8000
+      LaunchTemplateData:
+        ImageId: !If [UseCustomAmi, !Ref WorkerAmiId, !Ref DeeplearningAmiId]
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt WorkerInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref PrivateSubnetId
+            Groups:
+              - !Ref WorkerSecurityGroup
+            AssociatePublicIpAddress: false
+            DeleteOnTermination: true
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSizeGiB
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        Monitoring:
+          Enabled: true
+        EbsOptimized: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${EnvironmentName}-mineru-gateway-worker"
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -euo pipefail
+            
+            LOG_FILE="/var/log/user-data-setup.log"
+            exec > >(tee -a "$LOG_FILE") 2>&1
+            
+            DOCKER_USERS=("ec2-user" "ssm-user")
+            MINERU_IMAGE="mineru:latest"
+            MINERU_CONTAINER_NAME="mineru-api"
+            MINERU_PORT="${MINERU_PORT:-8000}"
+            MINERU_BUILD_DIR="/opt/mineru-build"
+            MINERU_DOCKERFILE_URL="https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/global/Dockerfile"
+            
+            log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+            die() { log "ERROR: $*"; exit 1; }
+            
+            update_system() {
+              log "Updating system packages..."
+              dnf update -y || die "System update failed"
+            }
+            
+            install_docker() {
+              log "Installing Docker..."
+              dnf install -y docker curl --allowerasing || die "Docker install failed"
+              systemctl enable --now docker || die "Failed to enable Docker service"
+              log "Docker installed: $(docker --version)"
+            }
+            
+            install_cuda_drivers() {
+              if nvidia-smi &>/dev/null; then
+                log "NVIDIA driver already loaded (DLAMI): $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader)"
+              else
+                log "WARNING: nvidia-smi failed — wrong AMI? Use 'Deep Learning Base OSS Nvidia Driver GPU AMI (Amazon Linux 2023)'"
+              fi
+            }
+            
+            install_nvidia_container_toolkit() {
+              log "Configuring NVIDIA Container Toolkit for Docker..."
+              command -v nvidia-ctk &>/dev/null || die "nvidia-ctk not found — wrong AMI selected"
+              nvidia-ctk runtime configure --runtime=docker
+              systemctl restart docker
+              log "NVIDIA Container Toolkit configured: $(nvidia-ctk --version)"
+            }
+            
+            disable_systemd_cgroup_driver() {
+              log "Disabling systemd cgroup management in Docker..."
+              python3 -c "
+            import json
+            p='/etc/docker/daemon.json'
+            try:
+                with open(p) as f: c=json.load(f)
+            except FileNotFoundError:
+                c={}
+            c['exec-opts']=['native.cgroupdriver=cgroupfs']
+            with open(p,'w') as f: json.dump(c,f,indent=2)
+            " || die "Failed to update /etc/docker/daemon.json"
+              systemctl restart docker || die "Failed to restart docker"
+              log "Docker cgroup driver: $(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo unknown)"
+            }
+            
+            fix_dev_char_symlinks() {
+              log "Creating /dev/char symlinks..."
+              nvidia-ctk system create-dev-char-symlinks --create-all \
+                || die "Failed to create /dev/char symlinks"
+              log "/dev/char symlinks created"
+            }
+            
+            configure_dev_char_symlink_service() {
+              log "Installing boot-time /dev/char symlink service..."
+              cat > /etc/systemd/system/nvidia-dev-char-symlinks.service <<'EOF'
+            [Unit]
+            Description=Create /dev/char symlinks for NVIDIA GPU containers
+            After=nvidia-persistenced.service
+            Before=docker.service
+            
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/bin/nvidia-ctk system create-dev-char-symlinks --create-all
+            RemainAfterExit=true
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+              systemctl daemon-reload
+              systemctl enable nvidia-dev-char-symlinks.service
+              log "nvidia-dev-char-symlinks service installed"
+            }
+            
+            build_mineru_image() {
+              log "Downloading MinerU Dockerfile..."
+              mkdir -p "$MINERU_BUILD_DIR"
+              curl -fsSL "$MINERU_DOCKERFILE_URL" -o "${MINERU_BUILD_DIR}/Dockerfile" \
+                || die "Failed to download MinerU Dockerfile"
+              log "Building MinerU image (pulls vllm/vllm-openai base — several minutes)..."
+              docker build -t "$MINERU_IMAGE" "$MINERU_BUILD_DIR" || die "Failed to build MinerU image"
+              log "MinerU image built: ${MINERU_IMAGE}"
+            }
+            
+            configure_mineru_service() {
+              log "Configuring mineru-api systemd service..."
+              cat > /etc/systemd/system/mineru-api.service <<EOF
+            [Unit]
+            Description=MinerU API Server (Docker, hybrid-auto-engine)
+            Requires=docker.service
+            After=docker.service
+            
+            [Service]
+            Type=simple
+            Restart=on-failure
+            RestartSec=10
+            TimeoutStartSec=300
+            ExecStartPre=-/usr/bin/docker rm -f ${MINERU_CONTAINER_NAME}
+            ExecStart=/usr/bin/docker run --rm \
+                --name ${MINERU_CONTAINER_NAME} \
+                --gpus all \
+                --shm-size 32g \
+                --ipc=host \
+                -p ${MINERU_PORT}:${MINERU_PORT} \
+                --entrypoint mineru-api \
+                ${MINERU_IMAGE} \
+                --host 0.0.0.0 \
+                --port ${MINERU_PORT}
+            ExecStop=/usr/bin/docker stop ${MINERU_CONTAINER_NAME}
+            StandardOutput=journal
+            StandardError=journal
+            SyslogIdentifier=mineru-api
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+              systemctl daemon-reload
+              systemctl enable mineru-api
+              log "mineru-api service configured (port ${MINERU_PORT})"
+            }
+            
+            grant_docker_permissions() {
+              local user="$1"
+              id "$user" &>/dev/null || { log "Creating user: ${user}"; useradd -m -s /bin/bash "$user"; }
+              log "Granting Docker access to: ${user}"
+              usermod -aG docker "$user"
+            }
+            
+            grant_nopasswd_sudo() {
+              local user="$1"
+              log "Granting passwordless sudo to: ${user}"
+              echo "${user} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/99-${user}"
+              chmod 440 "/etc/sudoers.d/99-${user}"
+              visudo -cf "/etc/sudoers.d/99-${user}" || die "Invalid sudoers file for ${user}"
+            }
+
+            configure_users() {
+              log "Configuring user permissions..."
+              for user in "${DOCKER_USERS[@]}"; do
+                grant_docker_permissions "$user"
+                grant_nopasswd_sudo "$user"
+              done
+              local profile="/etc/profile.d/docker-group.sh"
+              cat > "$profile" <<'EOF'
+            if id -nG "$USER" 2>/dev/null | grep -qw docker; then
+              if ! groups 2>/dev/null | grep -qw docker; then exec newgrp docker; fi
+            fi
+            EOF
+              chmod 644 "$profile"
+            }
+            
+            auto_start_service() {
+              log "Verifying GPU before starting mineru-api..."
+              if ! nvidia-smi &>/dev/null; then
+                log "WARNING: nvidia-smi failed — skipping auto-start. Run manually: sudo systemctl start mineru-api"
+                return 0
+              fi
+              log "GPU ready: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader)"
+            
+              fix_dev_char_symlinks
+            
+              log "Starting mineru-api service..."
+              systemctl start mineru-api || { log "WARNING: mineru-api failed to start — check: sudo journalctl -u mineru-api -f"; return 1; }
+              wait_for_mineru
+            }
+            
+            wait_for_mineru() {
+              local url="http://localhost:${MINERU_PORT}/health"
+              local timeout=300 interval=10 elapsed=0
+              log "Waiting for mineru-api to be ready at ${url}..."
+              while [[ $elapsed -lt $timeout ]]; do
+                if curl -sf "$url" &>/dev/null; then
+                  log "mineru-api is ready! (${elapsed}s)"
+                  return 0
+                fi
+                log "  Still starting... (${elapsed}s elapsed)"
+                sleep $interval
+                elapsed=$((elapsed + interval))
+              done
+              log "WARNING: mineru-api did not become ready within ${timeout}s — check: sudo journalctl -u mineru-api -f"
+              return 1
+            }
+            
+            verify_installation() {
+              log "─── Verification ───────────────────────"
+              log "Docker:         $(docker --version)"
+              log "MinerU image:   $(docker images --format '{{.Repository}}:{{.Tag}} ({{.Size}})' | grep mineru || echo 'not built')"
+              log "Docker svc:     $(systemctl is-active docker)"
+              log "mineru-api svc: enabled=$(systemctl is-enabled mineru-api) active=$(systemctl is-active mineru-api 2>/dev/null || echo unknown)"
+              log "Cgroup driver:  $(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo unknown)"
+              log ""
+              log "  Parse:  http://<EC2_IP>:${MINERU_PORT}/file_parse  (expose in security group)"
+              log "  Docs:   http://<EC2_IP>:${MINERU_PORT}/docs"
+              log "  Health: http://localhost:${MINERU_PORT}/health"
+              log "  Logs:   sudo journalctl -u mineru-api -f"
+              log ""
+              log "  Client (no MinerU, no torch, no GPU needed):"
+              log "    curl -X POST http://<EC2_IP>:${MINERU_PORT}/file_parse -F \"files=@document.pdf\" -F \"return_md=true\" -F \"response_format_zip=false\""
+              log "────────────────────────────────────────"
+            }
+            
+            main() {
+              log "════ Starting EC2 bootstrap (MinerU hybrid-auto-engine) ════"
+              update_system
+              install_docker
+              install_cuda_drivers
+              install_nvidia_container_toolkit
+              disable_systemd_cgroup_driver
+              configure_dev_char_symlink_service
+              build_mineru_image
+              configure_mineru_service
+              configure_users
+              auto_start_service
+              verify_installation
+              log "════ Bootstrap complete ════"
+            }
+            
+            main
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: !Ref LaunchTemplateName
+
+Outputs:
+  LaunchTemplateId:
+    Description: Set cloud.aws.launch_template_id in gateway config.yaml
+    Value: !Ref WorkerLaunchTemplate
+    Export:
+      Name: !Sub "${AWS::StackName}-LaunchTemplateId"
+
+  LaunchTemplateName:
+    Description: Launch template name
+    Value: !Ref LaunchTemplateName
+    Export:
+      Name: !Sub "${AWS::StackName}-LaunchTemplateName"
+
+  WorkerSecurityGroupId:
+    Description: Security group attached to worker instances
+    Value: !Ref WorkerSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerSecurityGroupId"
+
+  WorkerInstanceProfileArn:
+    Description: IAM instance profile for workers
+    Value: !GetAtt WorkerInstanceProfile.Arn
+
+  ResultsBucketName:
+    Description: S3 bucket granted to worker instance role
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResultsBucket"
+
+  GatewayConfigHint:
+    Description: Paste into gateway config.yaml
+    Value: !Sub |
+      cloud_workers_enabled: true
+      deployment_id: "${EnvironmentName}"
+      cloud:
+        aws:
+          launch_template_id: ${WorkerLaunchTemplate}
+          launch_template_version: "$Latest"
+          bucket: ${ResultsBucket}
+      reconciliation:
+        launch_readiness_timeout_seconds: 3600

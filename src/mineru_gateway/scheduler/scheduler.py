@@ -1,4 +1,4 @@
-"""Single sequential scheduler loop."""
+"""Fast dispatch loop + slow reconcile loop."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from time import monotonic
+from time import time as wall_time
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -25,6 +26,7 @@ from mineru_gateway.cloud.types import (
     TAG_ROLE,
     TAG_ROLE_WORKER,
     DiscoveredInstance,
+    InstanceState,
     cloud_state_from_instance,
 )
 from mineru_gateway.config import GatewaySettings
@@ -46,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 _LOCK = type("Lock", (), {"held": True})()
 _HEALTH_BATCH = 32
+_STATUS_PORT = 8001
 
 
 @dataclass(frozen=True)
@@ -80,21 +83,36 @@ class Scheduler:
         self._next_cleanup_at: datetime | None = None
         self._next_cache_sweep_at: datetime | None = None
         self._next_rotation_check_at: datetime | None = None
-        self._poll_interval = settings.scheduler.poll_interval_seconds
+        self._dispatch_poll_interval = settings.scheduler.dispatch_poll_interval_seconds
+        self._reconcile_poll_interval = settings.scheduler.reconcile_poll_interval_seconds
 
     async def run(self) -> None:
-        logger.info("Scheduler loop starting")
+        logger.info(
+            "Scheduler loops starting (dispatch=%.2fs reconcile=%.2fs)",
+            self._dispatch_poll_interval,
+            self._reconcile_poll_interval,
+        )
+        await asyncio.gather(
+            self._run_loop(self._fast_tick, self._dispatch_poll_interval, "dispatch"),
+            self._run_loop(self._slow_tick, self._reconcile_poll_interval, "reconcile"),
+        )
+        logger.warning("Scheduler loops stopped — lock lost")
+
+    async def _run_loop(self, tick_fn, interval: float, name: str) -> None:
         while self._lock_held():
-            started = monotonic()
             try:
-                await self.tick()
+                await tick_fn()
             except Exception:
-                logger.exception("Scheduler tick failed")
-                await asyncio.sleep(self._poll_interval)
-                continue
-            elapsed = monotonic() - started
-            await asyncio.sleep(max(0.0, self._poll_interval - elapsed))
-        logger.warning("Scheduler loop stopped — lock lost")
+                logger.exception("%s tick failed", name)
+            await self._sleep_until_next_boundary(interval)
+
+    async def _sleep_until_next_boundary(self, interval: float) -> None:
+        """Sleep until the next wall-clock multiple of ``interval`` (e.g. :00, :10, :20…)."""
+        if interval <= 0:
+            return
+        now = wall_time()
+        next_boundary = (now // interval + 1) * interval
+        await asyncio.sleep(max(0.0, next_boundary - now))
 
     def _lock_held(self) -> bool:
         if hasattr(self._lock, "verify"):
@@ -102,11 +120,12 @@ class Scheduler:
         return getattr(self._lock, "held", True)
 
     async def tick(self) -> None:
+        await self._slow_tick()
+        await self._fast_tick()
+
+    async def _fast_tick(self) -> None:
         if not await self._verify_lock():
             return
-        await self._reconcile_workers()
-        await self._converge_stalled_workers()
-        await self._refresh_worker_health()
         await self._tasks.recover_stale_dispatch_claims()
         await self._synchronize_tasks_and_results()
         expired = await self._tasks.expire_client_sla_tasks(sla_seconds=self._settings.task_sla_seconds)
@@ -114,6 +133,13 @@ class Scheduler:
             metrics.record_sla_expired(expired)
             logger.info("Client SLA expired for %d tasks", expired)
         await self._dispatch_queued_tasks()
+
+    async def _slow_tick(self) -> None:
+        if not await self._verify_lock():
+            return
+        await self._reconcile_workers()
+        await self._converge_stalled_workers()
+        await self._refresh_worker_health()
         await self._apply_autoscaling()
         await self._advance_drains_and_rotations()
         await self._cleanup_if_due()
@@ -226,6 +252,8 @@ class Scheduler:
             await self._terminate_unowned_vm(inst, reason=reason)
 
     async def _terminate_unowned_vm(self, inst: DiscoveredInstance, *, reason: str) -> None:
+        if inst.state in (InstanceState.TERMINATING, InstanceState.TERMINATED):
+            return
         if self._provider is None:
             return
         logger.warning("Terminating unowned VM %s (%s)", inst.instance_id, reason)
@@ -332,9 +360,14 @@ class Scheduler:
 
         return None
 
+    async def _worker_connect_ip(self, provider: ComputeProvider, instance_id: str) -> str | None:
+        if self._settings.cloud.aws.worker_address == "public":
+            return await provider.get_public_ip(instance_id)
+        return await provider.get_private_ip(instance_id)
+
     async def _check_running_readiness(self, worker: Worker, provider: ComputeProvider) -> bool:
         """Sync the base_url and record a failure if the launch-readiness deadline passes. Returns True on failure."""
-        ip = await provider.get_private_ip(worker.instance_id)  # type: ignore[arg-type]
+        ip = await self._worker_connect_ip(provider, worker.instance_id)  # type: ignore[arg-type]
         if ip and worker.base_url != f"http://{ip}:8000":
             await self._workers.commit_fields(worker.id, base_url=f"http://{ip}:8000")
         timeout = self._settings.reconciliation.launch_readiness_timeout_seconds
@@ -385,14 +418,34 @@ class Scheduler:
         if not workers:
             return
 
-        async def _check(worker: Worker) -> tuple[Worker, bool, str | None]:
-            ok, error = await self._poll_health(worker.base_url or "")
-            return worker, ok, error
-
-        results = await asyncio.gather(*[_check(w) for w in workers])
+        results = await asyncio.gather(*[self._check_worker_health(w) for w in workers])
         healthy_count = await self._workers.apply_health_checks(results)
         if healthy_count < len(workers):
             logger.info("Health: %d/%d workers healthy", healthy_count, len(workers))
+
+    async def _check_worker_health(self, worker: Worker) -> tuple[Worker, bool, str | None, bool]:
+        provisioning = worker.ready_at is None
+        if provisioning:
+            ok, error = await self._poll_provisioning_status(worker.base_url or "")
+        else:
+            ok, error = await self._poll_health(worker.base_url or "")
+        return worker, ok, error, provisioning
+
+    def _status_url(self, base_url: str) -> str:
+        parts = urlsplit(base_url)
+        return f"{parts.scheme}://{parts.hostname}:{_STATUS_PORT}"
+
+    async def _poll_provisioning_status(self, base_url: str) -> tuple[bool, str | None]:
+        try:
+            resp = await self._client.get(f"{self._status_url(base_url)}/health", timeout=HEALTH_TIMEOUT)
+            body = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return False, str(exc)
+        if str(body.get("status", "")).lower() == "ready":
+            return True, None
+        stage, detail = body.get("stage"), body.get("detail")
+        error = f"stage={stage}" if stage else f"status={body.get('status')!r}"
+        return False, f"{error} detail={detail}" if detail else error
 
     async def _poll_health(self, base_url: str) -> tuple[bool, str | None]:
         try:
@@ -467,10 +520,9 @@ class Scheduler:
 
     async def _compute_scaling_signal(self) -> ScalingSignal:
         cfg = self._settings.scaling
+        inputs = await self._workers.collect_scaling_inputs()
         return compute_scaling_signal(
-            queue_depth=await self._workers.count_queue_depth(),
-            serviceable_workers=await self._workers.count_serviceable_workers(),
-            starting_workers=await self._workers.count_starting_workers(),
+            inputs=inputs,
             target_per_worker=cfg.target_per_worker,
             min_workers=cfg.min_workers,
             max_workers=cfg.max_workers,

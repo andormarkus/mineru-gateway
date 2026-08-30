@@ -36,15 +36,26 @@ def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_settings() -> Iterator[None]:
+def _reset_settings(request: pytest.FixtureRequest) -> Iterator[None]:
     """Ensure each test starts with an uncached settings singleton.
 
-    Tests that want specific config call ``reset_settings_cache()`` then
-    ``load_settings(...)`` or set env vars before importing the app.
-    """
-    from mineru_gateway.config import reset_settings_cache
+    Uses ``config.example.yaml`` so a local ``config.yaml`` (sandbox/prod) does not
+    leak into unit tests. Tests that need specific config call ``reset_settings_cache()``
+    then ``load_settings(...)`` or set env vars before importing the app.
 
+    Skipped for E2E tests — they manage settings via session fixtures and env.
+    """
+    if request.node.get_closest_marker("e2e") is not None:
+        yield
+        return
+
+    from pathlib import Path
+
+    from mineru_gateway.config import load_settings, reset_settings_cache
+
+    test_config = Path(__file__).resolve().parent.parent / "config.example.yaml"
     reset_settings_cache()
+    load_settings(config_path=test_config)
     yield
     reset_settings_cache()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -27,6 +28,8 @@ from mineru_gateway.config import get_settings, load_settings, reset_settings_ca
 from mineru_gateway.db.base import get_db_session
 from mineru_gateway.db.models import Task, Worker
 from mineru_gateway.scheduler.scheduler import Scheduler
+from mineru_gateway.scheduler.worker_repository import WorkerRepository
+from mineru_gateway.util.datetime import now_utc
 
 
 async def _seed_worker(db: AsyncSession, wid: str, base_url: str | None = None, **kwargs: object) -> None:
@@ -43,6 +46,7 @@ async def _seed_worker(db: AsyncSession, wid: str, base_url: str | None = None, 
         draining=bool(kwargs.get("draining", False)),
         drain_target=kwargs.get("drain_target"),  # type: ignore[arg-type]
         rotation_requested=bool(kwargs.get("rotation_requested", False)),
+        ready_at=kwargs.get("ready_at"),  # type: ignore[arg-type]
     )
     db.add(worker)
     await db.commit()
@@ -53,11 +57,39 @@ def _make_scheduler(client: httpx.AsyncClient) -> Scheduler:
 
 
 @pytest.mark.asyncio
+async def test_health_check_candidates_exclude_stopping_and_draining_workers(db_session: AsyncSession) -> None:
+    """Workers winding down must not be probed — EC2 stop kills the API before cloud_state clears."""
+    await _seed_worker(db_session, "active", "http://active:8000", ready_at=now_utc())
+    await _seed_worker(
+        db_session,
+        "stopping",
+        "http://stopping:8000",
+        desired_state="stopped",
+        cloud_state="stopping",
+        ready_at=now_utc(),
+    )
+    await _seed_worker(
+        db_session,
+        "draining",
+        "http://draining:8000",
+        draining=True,
+        drain_target="stopped",
+        ready_at=now_utc(),
+    )
+    await db_session.close()
+
+    repo = WorkerRepository(get_settings())
+    candidates = await repo.list_health_check_candidates(limit=32)
+    assert [w.id for w in candidates] == ["active"]
+
+
+@pytest.mark.asyncio
 async def test_scheduler_health_checks_run_concurrently(db_session: AsyncSession) -> None:
     """One slow worker health probe must not block the rest of the batch."""
-    await _seed_worker(db_session, "fast-1", "http://fast1:8000")
-    await _seed_worker(db_session, "slow-1", "http://slow1:8000")
-    await _seed_worker(db_session, "fast-2", "http://fast2:8000")
+    now = now_utc()
+    await _seed_worker(db_session, "fast-1", "http://fast1:8000", ready_at=now)
+    await _seed_worker(db_session, "slow-1", "http://slow1:8000", ready_at=now)
+    await _seed_worker(db_session, "fast-2", "http://fast2:8000", ready_at=now)
     await db_session.close()
 
     async def slow_health(_request: httpx.Request) -> httpx.Response:
@@ -85,7 +117,7 @@ async def test_scheduler_health_checks_run_concurrently(db_session: AsyncSession
 
 @pytest.mark.asyncio
 async def test_scheduler_health_marks_worker_healthy(db_session: AsyncSession) -> None:
-    await _seed_worker(db_session, "w1", "http://w1:8000")
+    await _seed_worker(db_session, "w1", "http://w1:8000", ready_at=now_utc())
     await db_session.close()
 
     with respx.mock(base_url="http://w1:8000") as mock:
@@ -106,7 +138,7 @@ async def test_scheduler_health_marks_worker_healthy(db_session: AsyncSession) -
 
 @pytest.mark.asyncio
 async def test_scheduler_health_marks_unreachable_worker_unhealthy(db_session: AsyncSession) -> None:
-    await _seed_worker(db_session, "w2", "http://w2:8000")
+    await _seed_worker(db_session, "w2", "http://w2:8000", ready_at=now_utc())
     await db_session.close()
 
     with respx.mock(base_url="http://w2:8000") as mock:
@@ -125,12 +157,48 @@ async def test_scheduler_health_marks_unreachable_worker_unhealthy(db_session: A
 
 
 @pytest.mark.asyncio
-async def test_scheduler_health_does_not_override_stopped_intent(db_session: AsyncSession) -> None:
-    await _seed_worker(db_session, "w-stop", "http://w:8000", desired_state="stopped", cloud_state="stopped")
+async def test_scheduler_health_skips_stopped_intent_workers(db_session: AsyncSession) -> None:
+    await _seed_worker(
+        db_session,
+        "w-stop",
+        "http://w:8000",
+        desired_state="stopped",
+        cloud_state="stopped",
+        healthy=False,
+        ready_at=now_utc(),
+    )
     await db_session.close()
 
-    with respx.mock(base_url="http://w:8000") as mock:
+    with respx.mock(base_url="http://w:8000", assert_all_called=False) as mock:
         mock.get("/health").mock(return_value=httpx.Response(200, json={"status": "healthy"}))
+        client = httpx.AsyncClient()
+        try:
+            await _make_scheduler(client)._refresh_worker_health()
+        finally:
+            await client.aclose()
+        assert not mock.calls
+
+    async with get_db_session() as session:
+        row = await session.get(Worker, "w-stop")
+    assert row is not None
+    assert row.desired_state == "stopped"
+    assert row.cloud_state == "stopped"
+    assert row.healthy is False
+    assert row.last_health_checked_at is None
+
+
+@pytest.mark.asyncio
+async def test_scheduler_health_polls_status_port_while_not_ready(db_session: AsyncSession) -> None:
+    """Never-ready workers are probed on the bootstrap-status port, not mineru-api's own port."""
+    await _seed_worker(db_session, "boot-1", "http://boot1:8000")
+    await db_session.close()
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(url__regex=r"http://boot1:8001/health").mock(
+            return_value=httpx.Response(
+                503, json={"status": "starting", "stage": "building_docker_image", "detail": "42s elapsed"}
+            )
+        )
         client = httpx.AsyncClient()
         try:
             await _make_scheduler(client)._refresh_worker_health()
@@ -138,10 +206,60 @@ async def test_scheduler_health_does_not_override_stopped_intent(db_session: Asy
             await client.aclose()
 
     async with get_db_session() as session:
-        row = await session.get(Worker, "w-stop")
+        row = await session.get(Worker, "boot-1")
     assert row is not None
-    assert row.desired_state == "stopped"
-    assert row.cloud_state == "stopped"
+    assert row.healthy is False
+    assert row.ready_at is None
+    assert row.last_error is None
+    assert row.provisioning_detail is not None
+    assert "building_docker_image" in row.provisioning_detail
+    assert "42s elapsed" in row.provisioning_detail
+
+
+@pytest.mark.asyncio
+async def test_scheduler_health_marks_ready_from_status_port(db_session: AsyncSession) -> None:
+    """Status port reporting "ready" flips healthy=True and sets ready_at for the first time."""
+    await _seed_worker(db_session, "boot-2", "http://boot2:8000")
+    await db_session.close()
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(url__regex=r"http://boot2:8001/health").mock(
+            return_value=httpx.Response(200, json={"status": "ready", "stage": "ready", "detail": "mineru-api healthy"})
+        )
+        client = httpx.AsyncClient()
+        try:
+            await _make_scheduler(client)._refresh_worker_health()
+        finally:
+            await client.aclose()
+
+    async with get_db_session() as session:
+        row = await session.get(Worker, "boot-2")
+    assert row is not None
+    assert row.healthy is True
+    assert row.ready_at is not None
+    assert row.last_error is None
+    assert row.provisioning_detail is None
+
+
+@pytest.mark.asyncio
+async def test_scheduler_health_switches_to_mineru_port_once_ready(db_session: AsyncSession) -> None:
+    """Once ready_at is set, later checks poll mineru-api's own port, not the status port."""
+    await _seed_worker(db_session, "boot-3", "http://boot3:8000", ready_at=now_utc())
+    await db_session.close()
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(url__regex=r"http://boot3:8000/health").mock(
+            return_value=httpx.Response(200, json={"status": "healthy"})
+        )
+        client = httpx.AsyncClient()
+        try:
+            await _make_scheduler(client)._refresh_worker_health()
+        finally:
+            await client.aclose()
+
+    async with get_db_session() as session:
+        row = await session.get(Worker, "boot-3")
+    assert row is not None
     assert row.healthy is True
 
 
@@ -193,6 +311,9 @@ class _FakeProvider(ComputeProvider):
 
     async def get_private_ip(self, instance_id: str) -> str | None:
         return "10.0.0.1"
+
+    async def get_public_ip(self, instance_id: str) -> str | None:
+        return "203.0.113.1"
 
     async def start(self, instance_id: str) -> None:
         return None
@@ -289,6 +410,26 @@ async def test_reconcile_terminates_duplicate_vms(db_session: AsyncSession) -> N
 
 
 @pytest.mark.asyncio
+async def test_reconcile_sets_public_base_url(db_session: AsyncSession) -> None:
+    reset_settings_cache()
+    settings = load_settings(cloud={"provider": "aws", "aws": {"worker_address": "public"}})
+    await _seed_worker(db_session, "pub-1", base_url=None, instance_id="i-pub-1")
+    await db_session.close()
+
+    client = httpx.AsyncClient()
+    try:
+        scheduler = Scheduler(settings=settings, store=InMemoryStore(name="test"), client=client, provider=_FakeProvider())
+        await scheduler._reconcile_workers()
+    finally:
+        await client.aclose()
+
+    async with get_db_session() as session:
+        row = await session.get(Worker, "pub-1")
+    assert row is not None
+    assert row.base_url == "http://203.0.113.1:8000"
+
+
+@pytest.mark.asyncio
 async def test_autoscale_drains_idle_worker_after_cooldown(db_session: AsyncSession) -> None:
     from datetime import timedelta
 
@@ -299,6 +440,7 @@ async def test_autoscale_drains_idle_worker_after_cooldown(db_session: AsyncSess
     async with get_db_session() as session:
         row = await session.get(Worker, "idle-w")
         assert row is not None
+        row.ready_at = now_utc() - timedelta(seconds=settings.scaling.idle_cooldown_seconds + 30)
         row.last_active_at = now_utc() - timedelta(seconds=settings.scaling.idle_cooldown_seconds + 30)
         await session.commit()
     await db_session.close()
@@ -317,6 +459,114 @@ async def test_autoscale_drains_idle_worker_after_cooldown(db_session: AsyncSess
     assert row is not None
     assert row.draining is True
     assert row.drain_target == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_autoscale_does_not_drain_while_worker_starting(db_session: AsyncSession) -> None:
+    from datetime import timedelta
+
+    from mineru_gateway.util.datetime import now_utc
+
+    settings = get_settings()
+    await _seed_worker(db_session, "idle-w", "http://idle:8000")
+    await _seed_worker(
+        db_session,
+        "boot-w",
+        "http://boot:8000",
+        cloud_state="running",
+        healthy=False,
+    )
+    async with get_db_session() as session:
+        row = await session.get(Worker, "idle-w")
+        assert row is not None
+        row.ready_at = now_utc() - timedelta(seconds=settings.scaling.idle_cooldown_seconds + 30)
+        row.last_active_at = now_utc() - timedelta(seconds=settings.scaling.idle_cooldown_seconds + 30)
+        await session.commit()
+    await db_session.close()
+
+    client = httpx.AsyncClient()
+    try:
+        scheduler = Scheduler(
+            settings=settings, store=InMemoryStore(name="test"), client=client, provider=_FakeProvider()
+        )
+        await scheduler._apply_autoscaling()
+    finally:
+        await client.aclose()
+
+    async with get_db_session() as session:
+        idle = await session.get(Worker, "idle-w")
+    assert idle is not None
+    assert idle.draining is False
+
+
+@pytest.mark.asyncio
+async def test_autoscale_does_not_drain_while_another_worker_draining(db_session: AsyncSession) -> None:
+    from datetime import timedelta
+
+    from mineru_gateway.util.datetime import now_utc
+
+    settings = get_settings()
+    await _seed_worker(db_session, "idle-w", "http://idle:8000")
+    await _seed_worker(db_session, "drain-w", "http://drain:8000", draining=True, drain_target="stopped")
+    async with get_db_session() as session:
+        row = await session.get(Worker, "idle-w")
+        assert row is not None
+        row.ready_at = now_utc() - timedelta(seconds=settings.scaling.idle_cooldown_seconds + 30)
+        row.last_active_at = now_utc() - timedelta(seconds=settings.scaling.idle_cooldown_seconds + 30)
+        await session.commit()
+    await db_session.close()
+
+    client = httpx.AsyncClient()
+    try:
+        scheduler = Scheduler(
+            settings=settings, store=InMemoryStore(name="test"), client=client, provider=_FakeProvider()
+        )
+        await scheduler._apply_autoscaling()
+    finally:
+        await client.aclose()
+
+    async with get_db_session() as session:
+        idle = await session.get(Worker, "idle-w")
+    assert idle is not None
+    assert idle.draining is False
+
+
+@pytest.mark.asyncio
+async def test_autoscale_drains_long_idle_not_newly_ready_worker(db_session: AsyncSession) -> None:
+    from datetime import timedelta
+
+    from mineru_gateway.util.datetime import now_utc
+
+    settings = get_settings()
+    cooldown = settings.scaling.idle_cooldown_seconds
+    await _seed_worker(db_session, "busy-w", "http://busy:8000")
+    await _seed_worker(db_session, "new-w", "http://new:8000")
+    async with get_db_session() as session:
+        busy = await session.get(Worker, "busy-w")
+        new = await session.get(Worker, "new-w")
+        assert busy is not None and new is not None
+        busy.ready_at = now_utc() - timedelta(hours=1)
+        busy.last_active_at = now_utc() - timedelta(seconds=cooldown + 30)
+        new.ready_at = now_utc() - timedelta(seconds=30)
+        new.last_active_at = None
+        await session.commit()
+    await db_session.close()
+
+    client = httpx.AsyncClient()
+    try:
+        scheduler = Scheduler(
+            settings=settings, store=InMemoryStore(name="test"), client=client, provider=_FakeProvider()
+        )
+        await scheduler._apply_autoscaling()
+    finally:
+        await client.aclose()
+
+    async with get_db_session() as session:
+        busy = await session.get(Worker, "busy-w")
+        new = await session.get(Worker, "new-w")
+    assert busy is not None and new is not None
+    assert busy.draining is True
+    assert new.draining is False
 
 
 @pytest.mark.asyncio
@@ -465,3 +715,90 @@ async def test_retention_skips_db_delete_when_object_delete_fails(db_session: As
     async with get_db_session() as session:
         row = await session.get(Task, "stale-1")
     assert row is not None
+
+
+@pytest.mark.asyncio
+async def test_fast_tick_invokes_dispatch_steps_only() -> None:
+    client = httpx.AsyncClient()
+    try:
+        scheduler = _make_scheduler(client)
+        scheduler._tasks.recover_stale_dispatch_claims = AsyncMock(return_value=0)
+        scheduler._synchronize_tasks_and_results = AsyncMock()
+        scheduler._tasks.expire_client_sla_tasks = AsyncMock(return_value=0)
+        scheduler._dispatch_queued_tasks = AsyncMock()
+        scheduler._reconcile_workers = AsyncMock()
+        scheduler._refresh_worker_health = AsyncMock()
+
+        await scheduler._fast_tick()
+
+        scheduler._tasks.recover_stale_dispatch_claims.assert_awaited_once()
+        scheduler._synchronize_tasks_and_results.assert_awaited_once()
+        scheduler._tasks.expire_client_sla_tasks.assert_awaited_once()
+        scheduler._dispatch_queued_tasks.assert_awaited_once()
+        scheduler._reconcile_workers.assert_not_awaited()
+        scheduler._refresh_worker_health.assert_not_awaited()
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_slow_tick_invokes_reconcile_steps_only() -> None:
+    client = httpx.AsyncClient()
+    try:
+        scheduler = _make_scheduler(client)
+        scheduler._reconcile_workers = AsyncMock()
+        scheduler._converge_stalled_workers = AsyncMock()
+        scheduler._refresh_worker_health = AsyncMock()
+        scheduler._apply_autoscaling = AsyncMock()
+        scheduler._advance_drains_and_rotations = AsyncMock()
+        scheduler._cleanup_if_due = AsyncMock()
+        scheduler._dispatch_queued_tasks = AsyncMock()
+
+        await scheduler._slow_tick()
+
+        scheduler._reconcile_workers.assert_awaited_once()
+        scheduler._converge_stalled_workers.assert_awaited_once()
+        scheduler._refresh_worker_health.assert_awaited_once()
+        scheduler._apply_autoscaling.assert_awaited_once()
+        scheduler._advance_drains_and_rotations.assert_awaited_once()
+        scheduler._cleanup_if_due.assert_awaited_once()
+        scheduler._dispatch_queued_tasks.assert_not_awaited()
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_run_drives_both_loops_at_different_cadences() -> None:
+    client = httpx.AsyncClient()
+    try:
+        scheduler = _make_scheduler(client)
+        scheduler._dispatch_poll_interval = 0.05
+        scheduler._reconcile_poll_interval = 0.2
+        fast_calls = 0
+        slow_calls = 0
+
+        async def counting_fast() -> None:
+            nonlocal fast_calls
+            fast_calls += 1
+            if fast_calls >= 3:
+                scheduler._lock.held = False
+
+        async def counting_slow() -> None:
+            nonlocal slow_calls
+            slow_calls += 1
+
+        scheduler._fast_tick = counting_fast
+        scheduler._slow_tick = counting_slow
+
+        async def noop_sleep(_interval: float) -> None:
+            await asyncio.sleep(0)
+
+        scheduler._sleep_until_next_boundary = noop_sleep
+
+        await scheduler.run()
+
+        assert fast_calls >= 3
+        assert slow_calls >= 1
+        assert fast_calls > slow_calls
+    finally:
+        await client.aclose()

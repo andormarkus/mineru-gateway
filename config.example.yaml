@@ -43,9 +43,8 @@ auth:
   api_key: null
 
 scheduler:
-  # Single scheduler process; PostgreSQL advisory lock prevents overlap in prod.
-  # Run replicas: 1 (K8s Recreate strategy) or ECS desired count 1.
-  poll_interval_seconds: 10
+  dispatch_poll_interval_seconds: 0.5
+  reconcile_poll_interval_seconds: 15
 
 reconciliation:
   launch_readiness_timeout_seconds: 1800
@@ -57,7 +56,6 @@ rotation:
   readiness_timeout_seconds: 1800
 
 retention:
-  # Scheduler deletes expired task payloads/results and cache objects.
   retention_days: 30
   cleanup_interval_seconds: 3600  # hourly
 
@@ -78,7 +76,9 @@ cloud:
     # EC2: moto/local only; omit ec2_endpoint_url for AWS EC2 in prod.
     ec2_endpoint_url: null
     launch_template_id: null
-    launch_template_version: "$Default"
+    launch_template_version: "$Latest"
+    # private (default): workers in private subnet; public: workers with public IP.
+    worker_address: "private"
 
 attribution:
   # MinerU LICENSE §2: online services built on MinerU must clearly indicate

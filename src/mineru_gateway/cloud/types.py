@@ -49,10 +49,23 @@ TAG_WORKER_ID = "mineru-gateway-worker-id"
 TAG_ROLE = "mineru-gateway-role"
 TAG_GENERATION = "mineru-gateway-generation"
 TAG_ROLE_WORKER = "worker"
+TAG_NAME = "Name"
+
+
+def format_worker_instance_name(*, deployment_id: str, worker_id: str) -> str:
+    """Human-readable EC2 ``Name`` tag: ``{deployment}-{suffix}``.
+
+    Worker IDs are ``cloud-{12-hex}`` in the DB; the ``Name`` tag drops the redundant
+    ``cloud-`` prefix. The full worker id remains on ``mineru-gateway-worker-id``.
+    Launch-template default names are overridden by tags passed at ``RunInstances``.
+    """
+    suffix = worker_id.removeprefix("cloud-")
+    return f"{deployment_id}-{suffix}"
 
 
 def build_worker_tags(*, worker_id: str, deployment_id: str, generation: int) -> dict[str, str]:
     return {
+        TAG_NAME: format_worker_instance_name(deployment_id=deployment_id, worker_id=worker_id),
         TAG_MANAGED: "true",
         TAG_DEPLOYMENT: deployment_id,
         TAG_WORKER_ID: worker_id,

@@ -251,7 +251,7 @@ cloud:
     region: us-east-1
     bucket: mineru-results
     launch_template_id: lt-0abc123
-    launch_template_version: "$Default"
+    launch_template_version: "$Latest"
 ```
 
 Worker VMs must run `mineru-api` (or equivalent) and register with the scheduler. The launch template should tag instances with the gateway's deployment identity.

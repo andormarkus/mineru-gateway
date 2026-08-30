@@ -36,7 +36,8 @@ class AwsCloudConfig(BaseModel):
 
     region: str = "us-east-1"
     launch_template_id: str | None = None
-    launch_template_version: str = "$Default"
+    launch_template_version: str = "$Latest"
+    worker_address: Literal["private", "public"] = "private"
     bucket: str = "mineru-results"
     endpoint_url: str | None = None  # S3/SeaweedFS dev/test; None → AWS S3
     ec2_endpoint_url: str | None = None  # EC2 moto/dev; None → AWS EC2
@@ -131,16 +132,19 @@ class RotationConfig(BaseModel):
 
 
 class SchedulerConfig(BaseModel):
-    """Scheduler process config — single sequential tick loop."""
+    """Scheduler process config — fast dispatch loop + slow reconcile loop."""
 
     model_config = ConfigDict(extra="forbid")
 
-    poll_interval_seconds: float = 10.0
+    dispatch_poll_interval_seconds: float = 0.5
+    reconcile_poll_interval_seconds: float = 15.0
 
     @model_validator(mode="after")
     def _validate_positive(self) -> SchedulerConfig:
-        if self.poll_interval_seconds <= 0:
-            raise ValueError("scheduler.poll_interval_seconds must be > 0")
+        if self.dispatch_poll_interval_seconds <= 0:
+            raise ValueError("scheduler.dispatch_poll_interval_seconds must be > 0")
+        if self.reconcile_poll_interval_seconds <= 0:
+            raise ValueError("scheduler.reconcile_poll_interval_seconds must be > 0")
         return self
 
 

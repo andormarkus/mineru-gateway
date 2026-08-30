@@ -13,6 +13,7 @@ from mineru_gateway.cloud.types import (
     TAG_DEPLOYMENT,
     TAG_GENERATION,
     TAG_MANAGED,
+    TAG_NAME,
     TAG_ROLE,
     TAG_ROLE_WORKER,
     TAG_WORKER_ID,
@@ -95,11 +96,30 @@ async def test_launch_tags_instance(ec2_provider: AwsEc2Provider, moto_ec2_endpo
 
     described = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
     tag_map = {tag["Key"]: tag["Value"] for tag in described["Tags"]}
+    assert tag_map[TAG_NAME] == "dep-1-worker-1"
     assert tag_map[TAG_DEPLOYMENT] == "dep-1"
     assert tag_map[TAG_WORKER_ID] == "worker-1"
     assert tag_map[TAG_GENERATION] == "2"
     assert tag_map[TAG_MANAGED] == "true"
     assert tag_map[TAG_ROLE] == TAG_ROLE_WORKER
+
+
+@pytest.mark.asyncio
+async def test_launch_name_strips_cloud_prefix(ec2_provider: AwsEc2Provider, moto_ec2_endpoint: str) -> None:
+    ec2 = _boto3_sync(moto_ec2_endpoint)
+    ec2.create_launch_template(
+        LaunchTemplateName="lt-name", LaunchTemplateData={"ImageId": "ami-test", "InstanceType": "t2.micro"}
+    )
+    lt_id = ec2.describe_launch_templates(LaunchTemplateNames=["lt-name"])["LaunchTemplates"][0]["LaunchTemplateId"]
+
+    cloud = cast(MagicMock, ec2_provider._cloud)
+    cloud.launch_template.return_value = (lt_id, "1", "us-east-1")
+    instance_id = await ec2_provider.launch("cloud-deadbeefcafe", deployment_id="e2e-pytest", generation=0)
+
+    described = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
+    tag_map = {tag["Key"]: tag["Value"] for tag in described["Tags"]}
+    assert tag_map[TAG_NAME] == "e2e-pytest-deadbeefcafe"
+    assert tag_map[TAG_WORKER_ID] == "cloud-deadbeefcafe"
 
 
 @pytest.mark.asyncio
@@ -157,6 +177,22 @@ async def test_idempotent_terminate(ec2_provider: AwsEc2Provider, moto_ec2_endpo
     await ec2_provider.terminate(instance_id)
     await ec2_provider.terminate(instance_id)
     assert await ec2_provider.get_state(instance_id) == InstanceState.TERMINATED
+
+
+@pytest.mark.asyncio
+async def test_get_public_ip(ec2_provider: AwsEc2Provider, moto_ec2_endpoint: str) -> None:
+    ec2 = _boto3_sync(moto_ec2_endpoint)
+    resp = ec2.run_instances(ImageId="ami-test", InstanceType="t2.micro", MinCount=1, MaxCount=1)
+    instance_id = resp["Instances"][0]["InstanceId"]
+
+    ip = await ec2_provider.get_public_ip(instance_id)
+    # moto may omit PublicIpAddress unless explicitly associated; method must not raise.
+    assert ip is None or isinstance(ip, str)
+
+
+@pytest.mark.asyncio
+async def test_get_public_ip_missing_instance_returns_none(ec2_provider: AwsEc2Provider) -> None:
+    assert await ec2_provider.get_public_ip("i-nonexistent") is None
 
 
 @pytest.mark.asyncio

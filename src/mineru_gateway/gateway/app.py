@@ -15,6 +15,7 @@ from mineru_gateway.attribution import install_attribution, upstream_info
 from mineru_gateway.cloud.registry import init_store
 from mineru_gateway.config import GatewaySettings, get_settings
 from mineru_gateway.db.base import init_engine, shutdown_engine
+from mineru_gateway.db.bootstrap import ensure_sqlite_schema
 from mineru_gateway.gateway.api.admin import router as admin_router
 from mineru_gateway.gateway.api.ocr import router as ocr_router
 from mineru_gateway.gateway.api.tasks import router as tasks_router
@@ -49,6 +50,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # --- DB ---
     init_engine(settings.database_url)
+    await ensure_sqlite_schema()
     logger.info("Database engine initialized")
 
     app.state.object_store = await init_store(settings)
