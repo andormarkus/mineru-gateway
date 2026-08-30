@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  mineru-gateway host — one small always-on EC2 instance that runs the gateway + scheduler +
+  Postgres via docker compose (deploy/compose/docker-compose.sandbox.yml).
+
+  Access is SSM Session Manager ONLY: no key pair, no SSH port, and the security group has NO
+  inbound rules. The SSM agent on the instance dials out to the SSM service.
+
+  The host's security group is the "gateway SG" the worker stacks reference: workers in private
+  subnets accept :8000 (mineru-api) and :8001 (bootstrap status) only from this group.
+
+  Launch → deploy → iterate → remove:
+    aws cloudformation create-stack ...            # this template
+    aws ssm start-session --target <InstanceId>   # operate
+    aws cloudformation delete-stack ...           # stop paying (~$0.04/hr t4g.medium)
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - PublicSubnetId
+      - Label:
+          default: Instance
+        Parameters:
+          - InstanceType
+          - RootVolumeSizeGiB
+      - Label:
+          default: Permissions
+        Parameters:
+          - ResultsBucket
+          - WorkerRoleArn
+      - Label:
+          default: Naming
+        Parameters:
+          - EnvironmentName
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the host. Workers must launch in the same VPC.
+
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Public subnet with an internet route (no NAT dependency: the host keeps a public IP but
+      its security group is fully closed — the SSM agent and docker outbound are enough).
+
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues:
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - t3.medium
+      - t3.large
+    Description: ARM (t4g) matches the default AL2023 arm64 AMI.
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 40
+    MinValue: 20
+    MaxValue: 200
+    Description: "Root volume: docker images, Postgres data, repo clone."
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: AL2023 (SSM agent + dnf). Must be arm64 for t4g types.
+
+  EnvironmentName:
+    Type: String
+    Default: sandbox
+    Description: Prefix for resource names.
+
+  ResultsBucket:
+    Type: String
+    Description: S3 bucket for payloads/results (must match cloud.aws.bucket in gateway config).
+
+  WorkerRoleArn:
+    Type: String
+    Description: >
+      IAM role behind the worker instance profile (output WorkerInstanceProfileArn's role).
+      The scheduler needs iam:PassRole on exactly this role to launch workers.
+
+Resources:
+  HostInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mineru-gateway-host"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-host-role"
+
+  HostSchedulerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: mineru-gateway-host-scheduler
+      Roles:
+        - !Ref HostInstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SchedulerControlsWorkers
+            Effect: Allow
+            Action:
+              - ec2:RunInstances
+              - ec2:StartInstances
+              - ec2:StopInstances
+              - ec2:TerminateInstances
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceTypes
+            Resource: "*"
+          - Sid: PassWorkerRoleOnLaunch
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Ref WorkerRoleArn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ec2.amazonaws.com
+          - Sid: ResultsBucketAccess
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !Sub "arn:aws:s3:::${ResultsBucket}"
+          - Sid: ResultsObjectAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub "arn:aws:s3:::${ResultsBucket}/*"
+
+  HostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-mineru-gateway-host"
+      Roles:
+        - !Ref HostInstanceRole
+
+  HostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-mineru-gateway-host"
+      GroupDescription: >
+        mineru-gateway host — NO inbound (SSM Session Manager only). Workers accept 8000/8001
+        from this group; operators tunnel the gateway port via SSM port forwarding.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: SSM service, docker registry, S3, package repos
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-host"
+
+  HostInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref HostInstanceProfile
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds:
+        - !Ref HostSecurityGroup
+      # Deliberately NO KeyName: SSM Session Manager is the only way in.
+      AssociatePublicIpAddress: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      Monitoring:
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-host"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/host-setup.log 2>&1
+          dnf update -y
+          dnf install -y docker git curl
+          dnf install -y docker-compose-plugin
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          # SSM agent ships with AL2023 and needs no config with the managed policy attached.
+          systemctl enable --now amazon-ssm-agent || true
+          echo "mineru-gateway host ready (docker $(docker --version))"
+
+Outputs:
+  InstanceId:
+    Description: SSM target for the host — aws ssm start-session --target <id>
+    Value: !Ref HostInstance
+
+  SecurityGroupId:
+    Description: >
+      Pass as GatewaySecurityGroupId to the worker stack (mineru-worker.yaml) — workers allow
+      8000/8001 inbound from this group only.
+    Value: !Ref HostSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+  RoleArn:
+    Description: Host role (SSM + scheduler EC2/S3 + PassRole on worker role).
+    Value: !GetAtt HostInstanceRole.Arn

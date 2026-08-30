@@ -1,0 +1,65 @@
+# mineru-gateway — sandbox host configuration template.
+#
+# Copy to config.yaml next to this file and fill in the values marked REQUIRED.
+# Keep the Postgres password in sync with GATEWAY_POSTGRES_PASSWORD in .env.
+# config.yaml is gitignored (it holds secrets).
+
+database_url: postgresql+asyncpg://gateway:REQUIRED_POSTGRES_PASSWORD@postgres:5432/gateway
+
+host: "0.0.0.0"
+port: 8000
+
+# Scopes reconciliation and tags cloud VMs. Keep stable per environment.
+deployment_id: "data-sandbox"
+log_level: "INFO"
+
+# Auth: the startup guard refuses a public bind without it. Send as
+# `Authorization: Bearer <key>` (or X-API-Key) from every caller.
+auth:
+  enabled: true
+  api_key: "REQUIRED openssl rand -hex 32"
+
+# 100 MiB soft cap (1 GiB hard cap is compiled in).
+max_file_size_bytes: 104857600
+
+cloud_workers_enabled: true
+
+# Scale from zero: idle GPU costs nothing; first request pays the worker cold
+# boot (10+ min building MinerU on first launch). Use the async /tasks flow.
+scaling:
+  min_workers: 0
+  max_workers: 2
+  target_per_worker: 4
+  idle_cooldown_seconds: 600
+  scale_up_cooldown_seconds: 120
+
+scheduler:
+  dispatch_poll_interval_seconds: 0.5
+  reconcile_poll_interval_seconds: 15
+
+reconciliation:
+  # 12 min covers a warm-AMI worker start; the very first bootstrap (Docker
+  # build in user-data) takes longer — the launch template bakes models, so
+  # first-ever launch may need 3600.
+  launch_readiness_timeout_seconds: 720
+  max_failure_count: 8
+  stalled_worker_grace_seconds: 900
+
+retention:
+  retention_days: 30
+  cleanup_interval_seconds: 3600
+
+cache:
+  enabled: true
+  ttl_seconds: 604800
+
+cloud:
+  provider: "aws"
+  aws:
+    region: "eu-central-1"
+    bucket: "REQUIRED ResultsBucket from the worker stack"
+    launch_template_id: "REQUIRED LaunchTemplateId from the worker stack"
+    launch_template_version: "$Latest"
+    # Workers in private subnets — the scheduler (this host) reaches them via
+    # private IPs; their SG allows 8000/8001 from this host's SG only.
+    worker_address: "private"
