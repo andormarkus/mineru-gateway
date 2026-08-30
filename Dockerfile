@@ -24,13 +24,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=LICENSE,target=LICENSE \
     uv sync --frozen --no-install-project --no-dev --extra postgres
 
-# Now copy the source and install the project itself.
+# Now copy the source and install the project itself. The bind mounts from the
+# layer above do not persist, so pyproject/lock must be mounted again here.
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=README.md,target=README.md \
+    --mount=type=bind,source=LICENSE,target=LICENSE \
     uv sync --frozen --no-dev --extra postgres
 
 # ----------------------------------------------------------------- runtime ---
 FROM python:3.13-slim AS runtime
+
+# cv2 (via mineru's import chain) needs X11/GL libs absent from slim images.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Drop privileges.
 RUN groupadd --system --gid 1001 gateway \
