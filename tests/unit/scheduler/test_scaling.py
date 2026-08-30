@@ -19,10 +19,7 @@ async def _signal(db: AsyncSession) -> ScalingSignal:
     cfg = settings.scaling
     inputs = await repo.collect_scaling_inputs()
     return compute_scaling_signal(
-        inputs=inputs,
-        target_per_worker=cfg.target_per_worker,
-        min_workers=cfg.min_workers,
-        max_workers=cfg.max_workers,
+        inputs=inputs, target_per_worker=cfg.target_per_worker, min_workers=cfg.min_workers, max_workers=cfg.max_workers
     )
 
 
@@ -86,11 +83,7 @@ async def test_max_workers_cap(db_session: AsyncSession) -> None:
         await _seed_task(db_session, f"t{i}")
     sig = compute_scaling_signal(
         inputs=ScalingInputs(
-            queue_depth=20,
-            serviceable_workers=1,
-            starting_workers=0,
-            draining_workers=0,
-            stopping_workers=0,
+            queue_depth=20, serviceable_workers=1, starting_workers=0, draining_workers=0, stopping_workers=0
         ),
         target_per_worker=4,
         min_workers=0,
@@ -104,11 +97,7 @@ async def test_max_workers_cap(db_session: AsyncSession) -> None:
 async def test_min_workers_floor_with_empty_queue(db_session: AsyncSession) -> None:
     sig = compute_scaling_signal(
         inputs=ScalingInputs(
-            queue_depth=0,
-            serviceable_workers=0,
-            starting_workers=0,
-            draining_workers=0,
-            stopping_workers=0,
+            queue_depth=0, serviceable_workers=0, starting_workers=0, draining_workers=0, stopping_workers=0
         ),
         target_per_worker=4,
         min_workers=2,
@@ -136,13 +125,7 @@ async def test_scale_down_when_overprovisioned(db_session: AsyncSession) -> None
 async def test_no_scale_down_while_workers_starting(db_session: AsyncSession) -> None:
     """Empty queue must not trigger idle drain while another worker is still booting."""
     await _seed_worker(db_session, "w-idle")
-    await _seed_worker(
-        db_session,
-        "w-boot",
-        cloud_state="running",
-        healthy=False,
-        base_url="http://203.0.113.9:8000",
-    )
+    await _seed_worker(db_session, "w-boot", cloud_state="running", healthy=False, base_url="http://203.0.113.9:8000")
     worker = await db_session.get(Worker, "w-idle")
     assert worker is not None
     worker.last_active_at = datetime.now(UTC) - timedelta(seconds=600)
@@ -176,13 +159,7 @@ async def test_no_scale_down_while_worker_draining(db_session: AsyncSession) -> 
 @pytest.mark.asyncio
 async def test_no_scale_down_while_worker_stopping(db_session: AsyncSession) -> None:
     await _seed_worker(db_session, "w-active")
-    await _seed_worker(
-        db_session,
-        "w-stop",
-        cloud_state="stopping",
-        healthy=False,
-        base_url="http://stop:8000",
-    )
+    await _seed_worker(db_session, "w-stop", cloud_state="stopping", healthy=False, base_url="http://stop:8000")
     worker = await db_session.get(Worker, "w-active")
     assert worker is not None
     worker.last_active_at = datetime.now(UTC) - timedelta(seconds=600)
@@ -198,11 +175,7 @@ async def test_queue_depth_three_keeps_desired_two_at_target_two(db_session: Asy
     """E2E keepalive uses depth=3 to hold desired=2 when target_per_worker=2."""
     sig = compute_scaling_signal(
         inputs=ScalingInputs(
-            queue_depth=3,
-            serviceable_workers=2,
-            starting_workers=0,
-            draining_workers=0,
-            stopping_workers=0,
+            queue_depth=3, serviceable_workers=2, starting_workers=0, draining_workers=0, stopping_workers=0
         ),
         target_per_worker=2,
         min_workers=0,
@@ -216,11 +189,7 @@ async def test_queue_depth_three_keeps_desired_two_at_target_two(db_session: Asy
 async def test_queue_depth_one_scales_down_with_two_serviceable(db_session: AsyncSession) -> None:
     sig = compute_scaling_signal(
         inputs=ScalingInputs(
-            queue_depth=1,
-            serviceable_workers=2,
-            starting_workers=0,
-            draining_workers=0,
-            stopping_workers=0,
+            queue_depth=1, serviceable_workers=2, starting_workers=0, draining_workers=0, stopping_workers=0
         ),
         target_per_worker=2,
         min_workers=0,
@@ -243,13 +212,7 @@ async def test_starting_workers_count_toward_provisioned(db_session: AsyncSessio
 @pytest.mark.asyncio
 async def test_bootstrapping_workers_count_toward_provisioned(db_session: AsyncSession) -> None:
     """EC2 running but MinerU not healthy yet must not trigger a duplicate scale-up."""
-    await _seed_worker(
-        db_session,
-        "w-warm",
-        cloud_state="running",
-        healthy=False,
-        base_url="http://203.0.113.9:8000",
-    )
+    await _seed_worker(db_session, "w-warm", cloud_state="running", healthy=False, base_url="http://203.0.113.9:8000")
     await _seed_task(db_session, "t1")
     sig = await _signal(db_session)
     assert sig.starting_workers == 1

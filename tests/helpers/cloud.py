@@ -53,8 +53,7 @@ def e2e_aws_configured() -> bool:
 
 def scheduler_poll_interval_seconds() -> float:
     return _env_float(
-        "MINERU_GATEWAY_SCHEDULER__RECONCILE_POLL_INTERVAL_SECONDS",
-        SchedulerConfig().reconcile_poll_interval_seconds,
+        "MINERU_GATEWAY_SCHEDULER__RECONCILE_POLL_INTERVAL_SECONDS", SchedulerConfig().reconcile_poll_interval_seconds
     )
 
 
@@ -105,9 +104,7 @@ def load_e2e_cloud_config(*, database_url: str) -> E2eCloudConfig | None:
         deployment_id=os.environ.get("MINERU_GATEWAY_DEPLOYMENT_ID", "e2e-pytest").strip(),
         region=os.environ.get("MINERU_GATEWAY_CLOUD__AWS__REGION", os.environ.get("AWS_REGION", "us-east-1")).strip(),
         launch_template_id=launch_template_id,
-        launch_template_version=os.environ.get(
-            "MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_VERSION", "$Latest"
-        ).strip(),
+        launch_template_version=os.environ.get("MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_VERSION", "$Latest").strip(),
         bucket=bucket,
         worker_address=os.environ.get("MINERU_GATEWAY_CLOUD__AWS__WORKER_ADDRESS", "public").strip(),
         min_workers=_env_int("MINERU_GATEWAY_SCALING__MIN_WORKERS", 1),
@@ -139,12 +136,10 @@ def apply_e2e_env(monkeypatch: pytest.MonkeyPatch, cfg: E2eCloudConfig) -> None:
     monkeypatch.setenv("MINERU_GATEWAY_SCALING__IDLE_COOLDOWN_SECONDS", str(cfg.idle_cooldown_seconds))
     monkeypatch.setenv("MINERU_GATEWAY_SCALING__SCALE_UP_COOLDOWN_SECONDS", "5")
     monkeypatch.setenv(
-        "MINERU_GATEWAY_SCHEDULER__RECONCILE_POLL_INTERVAL_SECONDS",
-        str(cfg.scheduler_poll_interval_seconds),
+        "MINERU_GATEWAY_SCHEDULER__RECONCILE_POLL_INTERVAL_SECONDS", str(cfg.scheduler_poll_interval_seconds)
     )
     monkeypatch.setenv(
-        "MINERU_GATEWAY_RECONCILIATION__LAUNCH_READINESS_TIMEOUT_SECONDS",
-        str(cfg.launch_readiness_timeout_seconds),
+        "MINERU_GATEWAY_RECONCILIATION__LAUNCH_READINESS_TIMEOUT_SECONDS", str(cfg.launch_readiness_timeout_seconds)
     )
     monkeypatch.setenv("MINERU_GATEWAY_AUTH__ENABLED", "false")
     monkeypatch.setenv("MINERU_GATEWAY_CACHE__ENABLED", "false")
@@ -256,20 +251,13 @@ async def wait_for_serviceable_workers(
         if last >= count:
             e2e_log(f"serviceable workers ready: {last}/{count}", always=True)
             return last
-        progress.report(
-            await format_gateway_snapshot(settings, provider),
-            signature=f"svc={last}/{count}",
-        )
+        progress.report(await format_gateway_snapshot(settings, provider), signature=f"svc={last}/{count}")
         await asyncio.sleep(poll)
     pytest.fail(f"expected >={count} serviceable workers within {timeout_seconds}s (last={last})")
 
 
 async def wait_for_workers_gone(
-    provider: ComputeProvider,
-    settings: GatewaySettings,
-    *,
-    timeout_seconds: float,
-    poll_interval: float | None = None,
+    provider: ComputeProvider, settings: GatewaySettings, *, timeout_seconds: float, poll_interval: float | None = None
 ) -> None:
     """Wait until no live VMs remain (terminated or already shutting-down is OK)."""
     poll = scheduler_poll_interval_seconds() if poll_interval is None else poll_interval
@@ -283,8 +271,7 @@ async def wait_for_workers_gone(
             e2e_log("all VMs gone", always=True)
             return
         progress.report(
-            ", ".join(f"{i.instance_id}:{i.state}" for i in active),
-            signature=",".join(i.instance_id for i in active),
+            ", ".join(f"{i.instance_id}:{i.state}" for i in active), signature=",".join(i.instance_id for i in active)
         )
         await asyncio.sleep(poll)
     discovered = await provider.discover(settings.deployment_id)
@@ -296,8 +283,7 @@ def require_e2e_cloud_config(*, database_url: str) -> E2eCloudConfig:
     cfg = load_e2e_cloud_config(database_url=database_url)
     if cfg is None:
         pytest.skip(
-            "EC2 E2E requires MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_ID and "
-            "MINERU_GATEWAY_CLOUD__AWS__BUCKET"
+            "EC2 E2E requires MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_ID and MINERU_GATEWAY_CLOUD__AWS__BUCKET"
         )
     return cfg
 
@@ -305,7 +291,5 @@ def require_e2e_cloud_config(*, database_url: str) -> E2eCloudConfig:
 def init_e2e_provider(settings: GatewaySettings) -> ComputeProvider:
     provider = init_provider(settings)
     if provider is None:
-        raise RuntimeError(
-            "EC2 E2E requires cloud_workers_enabled=true and cloud.aws launch template + bucket"
-        )
+        raise RuntimeError("EC2 E2E requires cloud_workers_enabled=true and cloud.aws launch template + bucket")
     return provider

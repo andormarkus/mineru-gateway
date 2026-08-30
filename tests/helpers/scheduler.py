@@ -22,12 +22,7 @@ from mineru_gateway.scheduler.scheduler import Scheduler
 from tests.helpers.e2e_log import E2eProgress, e2e_log, format_gateway_snapshot
 
 # Scheduler tick steps that launch/terminate EC2 instances or depend on a compute provider.
-_EXCLUDED_TICK_STEPS = (
-    "_reconcile_workers",
-    "_apply_autoscaling",
-    "_advance_drains_and_rotations",
-    "_cleanup_if_due",
-)
+_EXCLUDED_TICK_STEPS = ("_reconcile_workers", "_apply_autoscaling", "_advance_drains_and_rotations", "_cleanup_if_due")
 
 
 async def run_pre_autoscaling_tick(scheduler: Scheduler, *, include_health_checks: bool) -> None:
@@ -108,9 +103,7 @@ async def full_scheduler_loop(
             e2e_log("scheduler loop started", always=True)
             while not stop.is_set():
                 await scheduler.tick()
-                progress.report(
-                    await format_gateway_snapshot(settings, provider),
-                )
+                progress.report(await format_gateway_snapshot(settings, provider))
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=poll)
                 except TimeoutError:

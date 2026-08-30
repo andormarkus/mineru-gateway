@@ -44,10 +44,7 @@ SAMPLE_PDF = FIXTURES_DIR / "pdf_sample_1.pdf"
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line(
-        "markers",
-        "e2e: tests requiring real AWS EC2 worker launch/stop and mineru-api (Tier-4)",
-    )
+    config.addinivalue_line("markers", "e2e: tests requiring real AWS EC2 worker launch/stop and mineru-api (Tier-4)")
     if e2e_aws_configured():
         from mineru_gateway.logging_config import configure_logging
 
@@ -107,13 +104,7 @@ async def e2e_session_vm_cleanup(e2e_teardown_timeout_seconds: float) -> AsyncIt
     )
 
 
-async def _teardown_session(
-    settings,
-    store: CloudStorageProvider,
-    provider,
-    *,
-    poll: float,
-) -> None:
+async def _teardown_session(settings, store: CloudStorageProvider, provider, *, poll: float) -> None:
     e2e_log("session teardown: drain workers + terminate VMs", always=True)
     await mark_all_workers_terminated(settings)
     async with httpx.AsyncClient(timeout=60.0) as http_client:
@@ -154,17 +145,11 @@ async def _gateway_cloud_session(
         if warm_workers > 0:
             e2e_log(f"warming {warm_workers} worker(s) with scheduler", always=True)
             async with full_scheduler_loop(
-                settings,
-                store,
-                interval_seconds=poll,
-                client_timeout=e2e_worker_timeout_seconds,
+                settings, store, interval_seconds=poll, client_timeout=e2e_worker_timeout_seconds
             ):
                 await log_gateway_snapshot(settings, provider, label="initial")
                 await wait_for_serviceable_workers(
-                    settings,
-                    count=warm_workers,
-                    timeout_seconds=e2e_launch_timeout_seconds,
-                    provider=provider,
+                    settings, count=warm_workers, timeout_seconds=e2e_launch_timeout_seconds, provider=provider
                 )
         else:
             await log_gateway_snapshot(settings, provider, label="initial")
@@ -181,9 +166,7 @@ async def _gateway_cloud_session(
 
 @pytest_asyncio.fixture(scope="session")
 async def gateway_cloud_e2e_session(
-    tmp_path_factory: pytest.TempPathFactory,
-    e2e_worker_timeout_seconds: float,
-    e2e_launch_timeout_seconds: float,
+    tmp_path_factory: pytest.TempPathFactory, e2e_worker_timeout_seconds: float, e2e_launch_timeout_seconds: float
 ) -> AsyncIterator[tuple[AsyncClient, CloudStorageProvider]]:
     """Quick smoke: one warm worker for health + single task."""
     db_dir = tmp_path_factory.mktemp("e2e-smoke")
@@ -201,9 +184,7 @@ async def gateway_cloud_e2e_session(
 
 @pytest_asyncio.fixture(scope="session")
 async def gateway_cloud_e2e_scheduler_session(
-    tmp_path_factory: pytest.TempPathFactory,
-    e2e_worker_timeout_seconds: float,
-    e2e_launch_timeout_seconds: float,
+    tmp_path_factory: pytest.TempPathFactory, e2e_worker_timeout_seconds: float, e2e_launch_timeout_seconds: float
 ) -> AsyncIterator[tuple[AsyncClient, CloudStorageProvider]]:
     """Full scheduler E2E: scale-from-zero, autoscale, rotation, drain on real AWS."""
     db_dir = tmp_path_factory.mktemp("e2e-scheduler")

@@ -42,11 +42,7 @@ class ScalingSignal:
 
 
 def compute_scaling_signal(
-    *,
-    inputs: ScalingInputs,
-    target_per_worker: int,
-    min_workers: int,
-    max_workers: int,
+    *, inputs: ScalingInputs, target_per_worker: int, min_workers: int, max_workers: int
 ) -> ScalingSignal:
     queue_desired = 0 if inputs.queue_depth == 0 else math.ceil(inputs.queue_depth / target_per_worker)
     floor = max(queue_desired, 1 if inputs.queue_depth > 0 else 0)

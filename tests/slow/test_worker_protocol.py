@@ -28,9 +28,7 @@ async def test_worker_health(worker_url: str) -> None:
 
 @pytest.mark.asyncio
 async def test_worker_submit_and_result(
-    worker_url: str,
-    sample_pdf: tuple[str, bytes],
-    worker_timeout_seconds: float,
+    worker_url: str, sample_pdf: tuple[str, bytes], worker_timeout_seconds: float
 ) -> None:
     """Submit a PDF to the worker directly and fetch the result ZIP."""
     filename, pdf_bytes = sample_pdf

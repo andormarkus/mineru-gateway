@@ -69,12 +69,7 @@ async def test_health_check_candidates_exclude_stopping_and_draining_workers(db_
         ready_at=now_utc(),
     )
     await _seed_worker(
-        db_session,
-        "draining",
-        "http://draining:8000",
-        draining=True,
-        drain_target="stopped",
-        ready_at=now_utc(),
+        db_session, "draining", "http://draining:8000", draining=True, drain_target="stopped", ready_at=now_utc()
     )
     await db_session.close()
 
@@ -418,7 +413,9 @@ async def test_reconcile_sets_public_base_url(db_session: AsyncSession) -> None:
 
     client = httpx.AsyncClient()
     try:
-        scheduler = Scheduler(settings=settings, store=InMemoryStore(name="test"), client=client, provider=_FakeProvider())
+        scheduler = Scheduler(
+            settings=settings, store=InMemoryStore(name="test"), client=client, provider=_FakeProvider()
+        )
         await scheduler._reconcile_workers()
     finally:
         await client.aclose()
@@ -469,13 +466,7 @@ async def test_autoscale_does_not_drain_while_worker_starting(db_session: AsyncS
 
     settings = get_settings()
     await _seed_worker(db_session, "idle-w", "http://idle:8000")
-    await _seed_worker(
-        db_session,
-        "boot-w",
-        "http://boot:8000",
-        cloud_state="running",
-        healthy=False,
-    )
+    await _seed_worker(db_session, "boot-w", "http://boot:8000", cloud_state="running", healthy=False)
     async with get_db_session() as session:
         row = await session.get(Worker, "idle-w")
         assert row is not None
@@ -781,7 +772,7 @@ async def test_run_drives_both_loops_at_different_cadences() -> None:
             nonlocal fast_calls
             fast_calls += 1
             if fast_calls >= 3:
-                scheduler._lock.held = False
+                scheduler._lock.held = False  # type: ignore[union-attr]
 
         async def counting_slow() -> None:
             nonlocal slow_calls
@@ -790,7 +781,7 @@ async def test_run_drives_both_loops_at_different_cadences() -> None:
         scheduler._fast_tick = counting_fast
         scheduler._slow_tick = counting_slow
 
-        async def noop_sleep(_interval: float) -> None:
+        async def noop_sleep(interval: float) -> None:
             await asyncio.sleep(0)
 
         scheduler._sleep_until_next_boundary = noop_sleep

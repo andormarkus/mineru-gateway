@@ -50,19 +50,14 @@ async def test_gateway_meta_endpoints(
 
 @pytest.mark.asyncio
 async def test_get_task_status_api(
-    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_timeout_seconds: float,
+    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_timeout_seconds: float
 ) -> None:
     """GET /tasks/{id} reflects queued → completed lifecycle."""
     client, _, store = gateway_with_external_worker
     settings = get_settings()
 
     async with pre_autoscaling_scheduler_loop(settings, store, client_timeout=worker_timeout_seconds):
-        submit = await client.post(
-            "/tasks",
-            files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))],
-            data=_FORM,
-        )
+        submit = await client.post("/tasks", files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))], data=_FORM)
         assert submit.status_code == 202, submit.text
         task_id = submit.json()["task_id"]
 
@@ -77,8 +72,7 @@ async def test_get_task_status_api(
 
 @pytest.mark.asyncio
 async def test_file_parse_sync(
-    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_timeout_seconds: float,
+    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_timeout_seconds: float
 ) -> None:
     """POST /file_parse blocks until the worker result ZIP is ready."""
     client, _, store = gateway_with_external_worker
@@ -98,8 +92,7 @@ async def test_file_parse_sync(
 
 @pytest.mark.asyncio
 async def test_cache_dedup_miss_then_hit(
-    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_timeout_seconds: float,
+    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_timeout_seconds: float
 ) -> None:
     """Identical submit twice → second request completes from cache without re-dispatch."""
     client, _, store = gateway_with_external_worker
@@ -108,11 +101,7 @@ async def test_cache_dedup_miss_then_hit(
     cache_key, _ = compute_cache_key(file_records, _FORM)
 
     async with pre_autoscaling_scheduler_loop(settings, store, client_timeout=worker_timeout_seconds):
-        resp1 = await client.post(
-            "/tasks",
-            files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))],
-            data=_FORM,
-        )
+        resp1 = await client.post("/tasks", files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))], data=_FORM)
         assert resp1.status_code == 202
         task1_id = resp1.json()["task_id"]
         await wait_for_task_status(task1_id, expected="completed", timeout_seconds=worker_timeout_seconds)
@@ -123,11 +112,7 @@ async def test_cache_dedup_miss_then_hit(
         assert cache_row.object_key
         assert await store.exists(cache_row.object_key)
 
-        resp2 = await client.post(
-            "/tasks",
-            files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))],
-            data=_FORM,
-        )
+        resp2 = await client.post("/tasks", files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))], data=_FORM)
         assert resp2.status_code == 202
         task2 = resp2.json()
         assert task2["status"] == "completed"
@@ -141,23 +126,16 @@ async def test_cache_dedup_miss_then_hit(
 
 @pytest.mark.asyncio
 async def test_cache_force_bypass(
-    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_timeout_seconds: float,
+    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_timeout_seconds: float
 ) -> None:
     """force=true bypasses cache and returns queued (not instant completed)."""
     client, _, store = gateway_with_external_worker
     settings = get_settings()
 
     async with pre_autoscaling_scheduler_loop(settings, store, client_timeout=worker_timeout_seconds):
-        await client.post(
-            "/tasks",
-            files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))],
-            data=_FORM,
-        )
+        await client.post("/tasks", files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))], data=_FORM)
         resp = await client.post(
-            "/tasks?force=true",
-            files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))],
-            data=_FORM,
+            "/tasks?force=true", files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))], data=_FORM
         )
     assert resp.status_code == 202
     assert resp.json()["status"] == "queued"
@@ -213,8 +191,7 @@ async def test_admin_recover_clears_stalled_drain(
 
 @pytest.mark.asyncio
 async def test_admin_cache_invalidate_and_sweep(
-    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_timeout_seconds: float,
+    gateway_with_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_timeout_seconds: float
 ) -> None:
     """Admin can invalidate a cache entry and sweep expired rows."""
     client, _, store = gateway_with_external_worker
@@ -223,11 +200,7 @@ async def test_admin_cache_invalidate_and_sweep(
     cache_key, _ = compute_cache_key(file_records, _FORM)
 
     async with pre_autoscaling_scheduler_loop(settings, store, client_timeout=worker_timeout_seconds):
-        resp = await client.post(
-            "/tasks",
-            files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))],
-            data=_FORM,
-        )
+        resp = await client.post("/tasks", files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))], data=_FORM)
         task_id = resp.json()["task_id"]
         await wait_for_task_status(task_id, expected="completed", timeout_seconds=worker_timeout_seconds)
 

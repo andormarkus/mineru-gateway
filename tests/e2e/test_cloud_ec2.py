@@ -20,9 +20,7 @@ _FORM = {"backend": "pipeline", "effort": "medium", "parse_method": "auto"}
 
 
 @pytest.mark.asyncio
-async def test_ec2_worker_is_healthy(
-    gateway_cloud_e2e_session: tuple[AsyncClient, CloudStorageProvider],
-) -> None:
+async def test_ec2_worker_is_healthy(gateway_cloud_e2e_session: tuple[AsyncClient, CloudStorageProvider]) -> None:
     """Worker was provisioned once in the session fixture before tests run."""
     client, _ = gateway_cloud_e2e_session
     settings = get_settings()
@@ -39,8 +37,7 @@ async def test_ec2_worker_is_healthy(
 
 @pytest.mark.asyncio
 async def test_ec2_submit_task_complete(
-    gateway_cloud_e2e_session: tuple[AsyncClient, CloudStorageProvider],
-    e2e_worker_timeout_seconds: float,
+    gateway_cloud_e2e_session: tuple[AsyncClient, CloudStorageProvider], e2e_worker_timeout_seconds: float
 ) -> None:
     """Dispatch to the warm session worker and fetch the S3 result."""
     client, store = gateway_cloud_e2e_session
@@ -49,25 +46,14 @@ async def test_ec2_submit_task_complete(
     scheduler_poll = settings.scheduler.reconcile_poll_interval_seconds
 
     async with full_scheduler_loop(
-        settings,
-        store,
-        interval_seconds=scheduler_poll,
-        client_timeout=e2e_worker_timeout_seconds,
+        settings, store, interval_seconds=scheduler_poll, client_timeout=e2e_worker_timeout_seconds
     ):
-        resp = await client.post(
-            "/tasks",
-            files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))],
-            data=_FORM,
-        )
+        resp = await client.post("/tasks", files=[("files", (_PDF_NAME, _PDF_BYTES, "application/pdf"))], data=_FORM)
         assert resp.status_code == 202, resp.text
         task_id = resp.json()["task_id"]
 
         await wait_for_task_status_api(
-            client,
-            task_id,
-            expected="completed",
-            timeout_seconds=e2e_worker_timeout_seconds,
-            poll_interval=poll,
+            client, task_id, expected="completed", timeout_seconds=e2e_worker_timeout_seconds, poll_interval=poll
         )
 
         result_resp = await client.get(f"/tasks/{task_id}/result")

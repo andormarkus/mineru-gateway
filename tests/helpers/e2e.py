@@ -76,14 +76,9 @@ async def wait_for_rotation_complete(
 
     replacement: dict | None = None
     while asyncio.get_running_loop().time() < deadline:
-        if maintain_queue and repo is not None and queue_feed_bytes is not None:
-            if await repo.count_queue_depth() == 0:
-                await submit_pdf_task(
-                    client,
-                    filename=f"e2e-feed-{feed_index % 3 + 1}.pdf",
-                    pdf_bytes=queue_feed_bytes,
-                )
-                feed_index += 1
+        if maintain_queue and repo is not None and queue_feed_bytes is not None and await repo.count_queue_depth() == 0:
+            await submit_pdf_task(client, filename=f"e2e-feed-{feed_index % 3 + 1}.pdf", pdf_bytes=queue_feed_bytes)
+            feed_index += 1
 
         workers = await fetch_admin_workers(client)
         replacement = find_replacement_for(workers, old_worker_id)
@@ -103,10 +98,9 @@ async def wait_for_rotation_complete(
                 f"(replacement={format_admin_workers([replacement]) if replacement else 'missing'})"
             )
 
-        if repl_serviceable and old.get("draining"):
+        if replacement is not None and repl_serviceable and old.get("draining"):
             e2e_log(
-                f"rotation complete: old={old_worker_id[:8]} drain replacement={replacement['id'][:8]} ok",
-                always=True,
+                f"rotation complete: old={old_worker_id[:8]} drain replacement={replacement['id'][:8]} ok", always=True
             )
             return old, replacement
 
@@ -145,9 +139,7 @@ async def maintain_min_queue_depth(
             try:
                 while not stop.is_set() and await repo.count_queue_depth() < min_depth:
                     await submit_pdf_task(
-                        client,
-                        filename=f"e2e-keepalive-{feed_index % 3 + 1}.pdf",
-                        pdf_bytes=pdf_bytes,
+                        client, filename=f"e2e-keepalive-{feed_index % 3 + 1}.pdf", pdf_bytes=pdf_bytes
                     )
                     feed_index += 1
             except Exception:
@@ -199,14 +191,9 @@ async def wait_for_autoscaler_idle_drain(
 
     initial = await fetch_admin_workers(client)
     baseline_running = {
-        w["id"]
-        for w in initial
-        if w.get("desired_state") == "running" and w.get("cloud_state") == "running"
+        w["id"] for w in initial if w.get("desired_state") == "running" and w.get("cloud_state") == "running"
     }
-    e2e_log(
-        f"idle-drain baseline: running_workers={sorted(baseline_running) or '(none)'}",
-        always=True,
-    )
+    e2e_log(f"idle-drain baseline: running_workers={sorted(baseline_running) or '(none)'}", always=True)
     if not baseline_running:
         pytest.fail("idle-drain precondition: expected at least one running worker")
 
@@ -273,11 +260,7 @@ async def wait_for_admin_workers(
 
 
 async def wait_for_provisioned_workers(
-    settings: GatewaySettings,
-    *,
-    count: int,
-    timeout_seconds: float,
-    poll_interval: float | None = None,
+    settings: GatewaySettings, *, count: int, timeout_seconds: float, poll_interval: float | None = None
 ) -> int:
     """Wait until serviceable + starting workers reach ``count``."""
     poll = scheduler_poll_interval_seconds() if poll_interval is None else poll_interval
@@ -287,10 +270,7 @@ async def wait_for_provisioned_workers(
     e2e_log(f"waiting for >={count} provisioned workers (timeout={timeout_seconds:.0f}s)")
     last = 0
     while asyncio.get_running_loop().time() < deadline:
-        serviceable, starting = await asyncio.gather(
-            repo.count_serviceable_workers(),
-            repo.count_starting_workers(),
-        )
+        serviceable, starting = await asyncio.gather(repo.count_serviceable_workers(), repo.count_starting_workers())
         last = serviceable + starting
         if last >= count:
             e2e_log(f"provisioned workers ready: {last}/{count}", always=True)
@@ -301,10 +281,7 @@ async def wait_for_provisioned_workers(
 
 
 async def wait_for_queue_empty(
-    settings: GatewaySettings,
-    *,
-    timeout_seconds: float,
-    poll_interval: float | None = None,
+    settings: GatewaySettings, *, timeout_seconds: float, poll_interval: float | None = None
 ) -> None:
     poll = scheduler_poll_interval_seconds() if poll_interval is None else poll_interval
     repo = WorkerRepository(settings)

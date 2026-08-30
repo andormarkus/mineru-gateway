@@ -13,11 +13,7 @@ from tests.helpers.e2e_log import E2eProgress, e2e_log, e2e_verbose
 
 
 async def wait_for_task_status(
-    task_id: str,
-    *,
-    expected: str,
-    timeout_seconds: float,
-    poll_interval: float = 1.0,
+    task_id: str, *, expected: str, timeout_seconds: float, poll_interval: float = 1.0
 ) -> Task:
     """Poll the DB until the task reaches ``expected`` status."""
     deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -32,12 +28,7 @@ async def wait_for_task_status(
 
 
 async def wait_for_task_status_api(
-    client: AsyncClient,
-    task_id: str,
-    *,
-    expected: str,
-    timeout_seconds: float,
-    poll_interval: float = 0.5,
+    client: AsyncClient, task_id: str, *, expected: str, timeout_seconds: float, poll_interval: float = 0.5
 ) -> dict:
     """Poll GET /tasks/{id} until the API reports ``expected`` status."""
     deadline = asyncio.get_running_loop().time() + timeout_seconds

@@ -72,10 +72,7 @@ def _worker_snapshot_part(worker) -> str:
     return part
 
 
-async def format_gateway_snapshot(
-    settings: GatewaySettings,
-    provider: ComputeProvider | None = None,
-) -> str:
+async def format_gateway_snapshot(settings: GatewaySettings, provider: ComputeProvider | None = None) -> str:
     repo = WorkerRepository(settings)
     if provider is not None:
         serviceable, starting, queue, workers, discovered = await asyncio.gather(
@@ -104,17 +101,11 @@ async def format_gateway_snapshot(
         live = [i for i in discovered if i.state not in _GONE_INSTANCE_STATES]
         ec2_bits = " ec2=[" + ",".join(f"{i.instance_id[-8:]}:{i.state}" for i in live[:6]) + "]"
 
-    return (
-        f"svc={serviceable} starting={starting} queue={queue} "
-        f"workers=[{worker_bits or '-'}]{ec2_bits}"
-    )
+    return f"svc={serviceable} starting={starting} queue={queue} workers=[{worker_bits or '-'}]{ec2_bits}"
 
 
 async def log_gateway_snapshot(
-    settings: GatewaySettings,
-    provider: ComputeProvider | None = None,
-    *,
-    label: str = "state",
+    settings: GatewaySettings, provider: ComputeProvider | None = None, *, label: str = "state"
 ) -> None:
     e2e_log(f"{label}: {await format_gateway_snapshot(settings, provider)}")
 
@@ -127,8 +118,7 @@ def format_admin_workers(workers: list[dict]) -> str:
         wid = str(w.get("id", "?"))[:8]
         bits.append(
             f"{wid}:{w.get('cloud_state', '?')}/"
-            f"{'ok' if w.get('healthy') else 'x'}"
-            + (" drain" if w.get("draining") else "")
+            f"{'ok' if w.get('healthy') else 'x'}" + (" drain" if w.get("draining") else "")
         )
     if len(workers) > 8:
         bits.append(f"+{len(workers) - 8}more")

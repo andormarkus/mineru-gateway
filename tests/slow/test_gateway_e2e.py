@@ -24,11 +24,7 @@ async def test_tasks_async_through_gateway(
     client, _, store = gateway_with_external_worker
     settings = get_settings()
 
-    async with pre_autoscaling_scheduler_loop(
-        settings,
-        store,
-        client_timeout=worker_timeout_seconds,
-    ):
+    async with pre_autoscaling_scheduler_loop(settings, store, client_timeout=worker_timeout_seconds):
         resp = await client.post(
             "/tasks",
             files=[("files", (filename, pdf_bytes, "application/pdf"))],
@@ -37,9 +33,7 @@ async def test_tasks_async_through_gateway(
         assert resp.status_code == 202, resp.text
         task_id = resp.json()["task_id"]
 
-        row = await wait_for_task_status(
-            task_id, expected="completed", timeout_seconds=worker_timeout_seconds
-        )
+        row = await wait_for_task_status(task_id, expected="completed", timeout_seconds=worker_timeout_seconds)
         assert row.result_key
 
         result_resp = await client.get(f"/tasks/{task_id}/result")
@@ -60,20 +54,12 @@ async def test_v1_ocr_through_gateway(
     client, _, store = gateway_with_external_worker
     settings = get_settings()
 
-    async with pre_autoscaling_scheduler_loop(
-        settings,
-        store,
-        client_timeout=worker_timeout_seconds,
-    ):
+    async with pre_autoscaling_scheduler_loop(settings, store, client_timeout=worker_timeout_seconds):
         resp = await client.post(
             "/v1/ocr",
             json={
                 "model": "mineru",
-                "document": {
-                    "type": "file",
-                    "file": base64.b64encode(pdf_bytes).decode(),
-                    "file_name": filename,
-                },
+                "document": {"type": "file", "file": base64.b64encode(pdf_bytes).decode(), "file_name": filename},
                 "backend": "pipeline",
             },
             timeout=worker_timeout_seconds + 30.0,

@@ -39,10 +39,7 @@ _PDF_NAME = SAMPLE_PDF.name
 
 @asynccontextmanager
 async def _e2e_scheduler(
-    settings: GatewaySettings,
-    store: CloudStorageProvider,
-    *,
-    client_timeout: float,
+    settings: GatewaySettings, store: CloudStorageProvider, *, client_timeout: float
 ) -> AsyncIterator[None]:
     """Per-test scheduler loop (reuses EC2 workers from the session DB)."""
     async with full_scheduler_loop(
@@ -91,27 +88,21 @@ async def test_02_autoscale_up_provisions_second_worker(
     target = settings.scaling.target_per_worker
     keepalive_depth = min_queue_depth_for_desired_workers(2, target_per_worker=target)
 
-    async with _e2e_scheduler(settings, store, client_timeout=e2e_worker_timeout_seconds):
+    async with (
+        _e2e_scheduler(settings, store, client_timeout=e2e_worker_timeout_seconds),
         # Hold desired>=2 until both workers are healthy (depth=1 → desired=1 @ target=2).
-        async with maintain_min_queue_depth(
-            client, settings, pdf_bytes=_PDF_BYTES, min_depth=keepalive_depth
-        ):
-            # ceil((target+1)/target) == 2 when target_per_worker == target (e.g. 3 tasks @ 2 → desired=2).
-            for i in range(target + 1):
-                await submit_pdf_task(client, filename=f"pdf_sample_{(i % 3) + 1}.pdf", pdf_bytes=_PDF_BYTES)
+        maintain_min_queue_depth(client, settings, pdf_bytes=_PDF_BYTES, min_depth=keepalive_depth),
+    ):
+        # ceil((target+1)/target) == 2 when target_per_worker == target (e.g. 3 tasks @ 2 → desired=2).
+        for i in range(target + 1):
+            await submit_pdf_task(client, filename=f"pdf_sample_{(i % 3) + 1}.pdf", pdf_bytes=_PDF_BYTES)
 
-            await wait_for_provisioned_workers(
-                settings,
-                count=2,
-                timeout_seconds=e2e_launch_timeout_seconds,
-                poll_interval=poll,
-            )
-            await wait_for_serviceable_workers(
-                settings,
-                count=2,
-                timeout_seconds=e2e_launch_timeout_seconds,
-                poll_interval=poll,
-            )
+        await wait_for_provisioned_workers(
+            settings, count=2, timeout_seconds=e2e_launch_timeout_seconds, poll_interval=poll
+        )
+        await wait_for_serviceable_workers(
+            settings, count=2, timeout_seconds=e2e_launch_timeout_seconds, poll_interval=poll
+        )
 
 
 @pytest.mark.asyncio
@@ -127,10 +118,10 @@ async def test_03_worker_rotation_replaces_instance(
     target = settings.scaling.target_per_worker
     keepalive_depth = min_queue_depth_for_desired_workers(2, target_per_worker=target)
 
+    # The feeder context must exit before the scheduler context: the backlog can
+    # only drain while the scheduler loop is still running.
     async with _e2e_scheduler(settings, store, client_timeout=e2e_worker_timeout_seconds):
-        async with maintain_min_queue_depth(
-            client, settings, pdf_bytes=_PDF_BYTES, min_depth=keepalive_depth
-        ):
+        async with maintain_min_queue_depth(client, settings, pdf_bytes=_PDF_BYTES, min_depth=keepalive_depth):
             await wait_for_serviceable_workers(
                 settings, count=2, timeout_seconds=e2e_launch_timeout_seconds, poll_interval=poll
             )
@@ -168,9 +159,7 @@ async def test_03_worker_rotation_replaces_instance(
             assert old.get("draining") is True
 
         # Stop keepalive feeder first, then drain backlog so test_04 starts at queue=0.
-        await wait_for_queue_empty(
-            settings, timeout_seconds=e2e_launch_timeout_seconds, poll_interval=poll
-        )
+        await wait_for_queue_empty(settings, timeout_seconds=e2e_launch_timeout_seconds, poll_interval=poll)
 
 
 @pytest.mark.asyncio
@@ -213,14 +202,13 @@ async def test_05_admin_drain_terminate_clears_pool(
             if worker.get("desired_state") == "terminated":
                 continue
             drain = await client.post(
-                f"/admin/workers/{worker['id']}/drain",
-                json={"reason": "e2e cleanup", "terminate": True},
+                f"/admin/workers/{worker['id']}/drain", json={"reason": "e2e cleanup", "terminate": True}
             )
             assert drain.status_code == 200, drain.text
 
         await wait_for_admin_workers(
             client,
-            predicate=lambda ws: ws and all(w.get("desired_state") == "terminated" for w in ws),
+            predicate=lambda ws: bool(ws) and all(w.get("desired_state") == "terminated" for w in ws),
             timeout_seconds=e2e_launch_timeout_seconds,
             poll_interval=poll,
             description="all workers desired_state=terminated",

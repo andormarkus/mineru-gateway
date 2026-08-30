@@ -26,8 +26,7 @@ _PDF_SAMPLE = FIXTURES_DIR / "pdf_sample_1.pdf"
 
 @pytest.mark.asyncio
 async def test_scheduler_health_probe_updates_worker_row(
-    gateway_with_unprobed_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_url: str,
+    gateway_with_unprobed_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_url: str
 ) -> None:
     """Scheduler polls GET {worker}/health and marks the DB row healthy + ready."""
     _client, worker_id, store = gateway_with_unprobed_external_worker
@@ -58,8 +57,7 @@ async def test_scheduler_health_probe_updates_worker_row(
 
 @pytest.mark.asyncio
 async def test_admin_workers_reflects_health_probe(
-    gateway_with_unprobed_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_url: str,
+    gateway_with_unprobed_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_url: str
 ) -> None:
     """GET /admin/workers exposes healthy=true after the scheduler health probe."""
     client, worker_id, store = gateway_with_unprobed_external_worker
@@ -84,8 +82,7 @@ async def test_admin_workers_reflects_health_probe(
 
 @pytest.mark.asyncio
 async def test_dispatch_blocked_until_health_probe(
-    gateway_with_unprobed_external_worker: tuple[AsyncClient, str, CloudStorageProvider],
-    worker_timeout_seconds: float,
+    gateway_with_unprobed_external_worker: tuple[AsyncClient, str, CloudStorageProvider], worker_timeout_seconds: float
 ) -> None:
     """Unhealthy workers are not dispatched until scheduler refreshes /health."""
     client, worker_id, store = gateway_with_unprobed_external_worker
@@ -102,11 +99,7 @@ async def test_dispatch_blocked_until_health_probe(
 
     # Dispatch loop without health checks — task must stay queued.
     async with pre_autoscaling_scheduler_loop(
-        settings,
-        store,
-        client_timeout=worker_timeout_seconds,
-        include_health_checks=False,
-        interval_seconds=0.1,
+        settings, store, client_timeout=worker_timeout_seconds, include_health_checks=False, interval_seconds=0.1
     ):
         await asyncio.sleep(1.0)
 
@@ -118,10 +111,7 @@ async def test_dispatch_blocked_until_health_probe(
     # Production-like loop: health probe then dispatch.
     deadline = asyncio.get_running_loop().time() + worker_timeout_seconds
     async with pre_autoscaling_scheduler_loop(
-        settings,
-        store,
-        client_timeout=worker_timeout_seconds,
-        interval_seconds=0.1,
+        settings, store, client_timeout=worker_timeout_seconds, interval_seconds=0.1
     ):
         while asyncio.get_running_loop().time() < deadline:
             async with get_db_session() as session:

@@ -75,11 +75,7 @@ def _ensure_s3_bucket(endpoint: str, bucket: str) -> None:
 
 
 def _apply_slow_test_env(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    database_url: str,
-    s3_endpoint: str,
-    s3_bucket: str,
+    monkeypatch: pytest.MonkeyPatch, *, database_url: str, s3_endpoint: str, s3_bucket: str
 ) -> None:
     """Configure gateway for local sqlite + SeaweedFS; disable EC2 autoscaling."""
     monkeypatch.setenv("MINERU_GATEWAY_DATABASE_URL", database_url)
@@ -161,10 +157,7 @@ async def _gateway_stack(
     from tests.helpers.worker import seed_worker_row
 
     _apply_slow_test_env(
-        monkeypatch,
-        database_url=sqlite_database_url,
-        s3_endpoint=seaweedfs_endpoint,
-        s3_bucket=slow_s3_bucket,
+        monkeypatch, database_url=sqlite_database_url, s3_endpoint=seaweedfs_endpoint, s3_bucket=slow_s3_bucket
     )
     reset_settings_cache()
     load_settings()

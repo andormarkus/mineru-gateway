@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -129,7 +130,7 @@ class WorkerRepository:
     def _dispatchable_clause(self, *, active_count: ScalarSelect[int]) -> ColumnElement[bool]:
         return and_(self._serviceable_clause(), active_count < self._settings.scaling.target_per_worker)
 
-    def _task_count_subquery(self, statuses: tuple[str, ...]) -> ScalarSelect[int]:
+    def _task_count_subquery(self, statuses: Collection[str]) -> ScalarSelect[int]:
         """Correlated count of a worker's tasks in ``statuses`` — used as a per-worker load signal."""
         query = select(func.count(Task.task_id)).where(Task.worker_id == Worker.id, Task.status.in_(statuses))
         return query.correlate(Worker).scalar_subquery()

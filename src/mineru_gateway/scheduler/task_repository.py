@@ -210,10 +210,7 @@ class TaskRepository:
             if worker is None:
                 if self._dispatch_deferred_since is None:
                     self._dispatch_deferred_since = now_utc()
-                    logger.info(
-                        "Dispatch deferred task=%s reason=no_dispatchable_worker",
-                        candidate.task_id,
-                    )
+                    logger.info("Dispatch deferred task=%s reason=no_dispatchable_worker", candidate.task_id)
                 return None
             if self._dispatch_deferred_since is not None:
                 elapsed = (now_utc() - ensure_aware_utc(self._dispatch_deferred_since)).total_seconds()
