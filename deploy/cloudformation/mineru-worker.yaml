@@ -48,7 +48,7 @@ Parameters:
   HostRoleName:
     Type: String
     Description: >
-      IAM role name of the gateway host (gateway-host.yaml RoleName output). This stack
+      IAM role name of the controller (controller.yaml RoleName output). This stack
       grants it iam:PassRole on the worker role so the scheduler can launch workers.
 
   InstanceType:
@@ -166,6 +166,16 @@ Resources:
             Condition:
               StringEquals:
                 iam:PassedToService: ec2.amazonaws.com
+
+  LaunchTemplateSsmParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/mineru-gateway/${EnvironmentName}/launch-template-id"
+      Type: String
+      Value: !Ref WorkerLaunchTemplate
+      Description: >
+        mineru-gateway worker launch template id. The gateway config resolves it with
+        launch_template_id: ssm:/mineru-gateway/<environment>/launch-template-id
 
   WorkerSecurityGroup:
     Type: AWS::EC2::SecurityGroup

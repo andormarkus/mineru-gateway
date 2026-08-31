@@ -146,7 +146,7 @@ ocr:
   - model_name: mineru
     litellm_params:
       model: ocr/mineru
-      api_base: http://<gateway-host>:8000
+      api_base: http://<controller>:8000
       api_key: <your-api-key>   # when auth.enabled: true
 ```
 
@@ -261,13 +261,16 @@ gateway. The scheduler launches them via the launch template, discovers them by
 deployment tags, health-checks `:8000`, polls `:8001` for bootstrap progress
 while they build, dispatches tasks, and terminates them when idle.
 
-Provision the worker infrastructure with the CloudFormation stacks in
+Provision the infrastructure with the CloudFormation stacks in
 `deploy/cloudformation/`:
 
 | Template | Purpose |
 |----------|---------|
-| `mineru-worker.yaml` | Worker launch template, IAM role, and SG: workers in a **private subnet**, no public IPs, `:8000`/`:8001` reachable only from the gateway-host SG. |
-| `gateway-host.yaml` | The host that runs gateway + scheduler + Postgres (see below). |
+| `controller.yaml` | **The controller** — the control plane: t4g instance running gateway + scheduler + Postgres (compose), plus (by default) the results S3 bucket with lifecycle rules. Private subnet, SSM-only, zero inbound. |
+| `mineru-worker.yaml` | Worker launch template, IAM role, SG: workers in a **private subnet**, no public IPs, `:8000`/`:8001` reachable only from the controller SG. Publishes the launch-template id to SSM Parameter Store. |
+
+The worker stack cannot raise GPU service quota (`L-DB27BBAB`) for you — no
+CloudFormation stack can; it needs account-side approval (see onboarding).
 
 ### Sandbox deployment (SSM, closed topology)
 
@@ -275,14 +278,14 @@ The v1 sandbox topology: everything private, zero inbound ports, operated via
 SSM Session Manager. The whole stack is repeatable — launch, deploy, iterate,
 remove. **Starting from an empty AWS account?** Do
 [`docs/ONBOARDING_A_NEW_ACCOUNT.md`](docs/ONBOARDING_A_NEW_ACCOUNT.md) first —
-network (public + private subnets with NAT), the S3 bucket + lifecycle rules,
-and the GPU quota request that gates everything.
+network (public + private subnets with NAT) and the GPU quota request that
+gates everything; the bucket comes with the controller stack.
 
 ```
  ┌──────────────────────────────── VPC ────────────────────────────────┐
  │ public subnet (NAT only)           private subnets                 │
  │ ┌───────────────┐                  ┌────────────────┐ ┌─────────┐ │
- │ │ NAT gateway   │◀──── egress ──────│ gateway host   │ │ GPU     │ │
+ │ │ NAT gateway   │◀──── egress ──────│ controller     │ │ GPU     │ │
  │ └───────────────┘                  │ gateway+worker │─▶ workers │ │
  │                no public IPs:      │ scheduler, pg  │ │ g5/g6,  │ │
  │                everything below    │ (t4g, compose) │ │ 0..2    │ │
@@ -293,30 +296,30 @@ and the GPU quota request that gates everything.
             operator laptop            results bucket ◀───────┘
 ```
 
-**How do you reach a host with no public IP?** The SSM agent on the instance
-opens an *outbound* TLS connection to the AWS SSM service; `aws ssm
+**How do you reach a controller with no public IP?** The SSM agent on the
+instance opens an *outbound* TLS connection to the AWS SSM service; `aws ssm
 start-session` talks to that same service, which relays your session through
-it. Nothing ever connects inbound to the host — that is why its security
+it. Nothing ever connects inbound to the controller — that is why its security
 group has no inbound rules and why it can sit in a private subnet.
 
-**1 — Host stack** (the SSM-operated dev machine; ~$0.04/hr t4g.medium).
-Create this first — the worker stack grants its SG ingress and the
-`iam:PassRole` permission to this host's role:
+**1 — Controller stack** (~$0.04/hr t4g.medium). Creates the control-plane
+instance *and*, unless you pass an existing bucket, the results bucket with
+lifecycle rules. Create it first — the worker stack grants its SG ingress and
+the `iam:PassRole` permission to the controller's role:
 
 ```bash
-aws cloudformation create-stack --stack-name mineru-gateway-host \
-  --template-body file://deploy/cloudformation/gateway-host.yaml \
+aws cloudformation create-stack --stack-name mineru-controller \
+  --template-body file://deploy/cloudformation/controller.yaml \
   --parameters \
     ParameterKey=VpcId,ParameterValue=vpc-... \
     ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
-    ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
     ParameterKey=EnvironmentName,ParameterValue=sandbox \
   --capabilities CAPABILITY_NAMED_IAM
-# Note the SecurityGroupId and RoleName outputs.
+# Outputs used below: InstanceId, SecurityGroupId, RoleName, ResultsBucketName
 ```
 
-**2 — Worker stack** (private subnets only; takes the host SG and host role
-from step 1):
+**2 — Worker stack** (private subnet; takes the controller SG, role, and
+bucket from step 1):
 
 ```bash
 aws cloudformation create-stack --stack-name mineru-worker-sandbox \
@@ -324,21 +327,23 @@ aws cloudformation create-stack --stack-name mineru-worker-sandbox \
   --parameters \
     ParameterKey=VpcId,ParameterValue=vpc-... \
     ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
-    ParameterKey=GatewaySecurityGroupId,ParameterValue=<host SecurityGroupId> \
-    ParameterKey=HostRoleName,ParameterValue=<host RoleName> \
-    ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
+    ParameterKey=GatewaySecurityGroupId,ParameterValue=<controller SecurityGroupId> \
+    ParameterKey=HostRoleName,ParameterValue=<controller RoleName> \
+    ParameterKey=ResultsBucket,ParameterValue=<controller ResultsBucketName> \
     ParameterKey=EnvironmentName,ParameterValue=sandbox \
   --capabilities CAPABILITY_NAMED_IAM
-# Note the LaunchTemplateId output — it goes into the gateway config.
+# The stack publishes its LaunchTemplateId to SSM at
+# /mineru-gateway/sandbox/launch-template-id — the gateway config reads it
+# from there; no lt- ids are ever copy-pasted.
 ```
 
 **3 — Deploy the stack over SSM** (no SSH, no keys, no open ports):
 
 ```bash
-HOST=$(aws cloudformation describe-stacks --stack-name mineru-gateway-host \
+CTRL=$(aws cloudformation describe-stacks --stack-name mineru-controller \
   --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text)
 
-aws ssm send-command --instance-ids "$HOST" \
+aws ssm send-command --instance-ids "$CTRL" \
   --document-name AWS-RunShellScript --comment "deploy mineru-gateway" \
   --commands 'git clone https://github.com/andormarkus/mineru-gateway.git ~/mineru-gateway &&
               cd ~/mineru-gateway && git checkout v0.1.0 &&
@@ -346,25 +351,27 @@ aws ssm send-command --instance-ids "$HOST" \
               cp .env.example .env && sed -i "s/change-me/$(openssl rand -hex 24)/" .env &&
               cp config.sandbox.yaml.example config.yaml &&
               docker compose -f docker-compose.sandbox.yml up -d --build'
-# then edit ~/mineru-gateway/deploy/compose/config.yaml on the host:
-#   api_key, bucket, launch_template_id, and the SAME postgres password as .env
+# then edit ~/mineru-gateway/deploy/compose/config.yaml on the controller:
+#   api_key, bucket, and the SAME postgres password as .env
+#   (launch_template_id already points at the SSM parameter)
 ```
 
 **4 — Operate:**
 
 ```bash
-aws ssm start-session --target "$HOST"    # interactive shell
-aws ssm start-session --target "$HOST" \
+aws ssm start-session --target "$CTRL"    # interactive shell
+aws ssm start-session --target "$CTRL" \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}'
 curl http://127.0.0.1:8000/health          # gateway through the tunnel
 ```
 
-**5 — Remove the dev machine** (GPU workers drain to zero on their own via
-`idle_cooldown_seconds`; the host is the only fixed cost):
+**5 — Remove the controller** (GPU workers drain to zero on their own via
+`idle_cooldown_seconds`; the controller is the only fixed compute cost — the
+bucket is retained):
 
 ```bash
-aws cloudformation delete-stack --stack-name mineru-gateway-host
+aws cloudformation delete-stack --stack-name mineru-controller
 ```
 
 **Scale-from-zero contract.** With `min_workers: 0` the fleet costs nothing

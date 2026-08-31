@@ -22,10 +22,15 @@ sandbox deployment repeatable over SSM with a closed topology.
   `ComputeProvider.get_public_ip()`.
 - Worker CloudFormation stacks (`deploy/cloudformation/mineru-worker*.yaml`)
   with full GPU bootstrap user-data and the status responder.
-- SSM-operated gateway host stack (`gateway-host.yaml`): private subnet, no
+- Controller stack (`controller.yaml`) — the control plane on one SSM-operated
+  instance: gateway + scheduler + Postgres via compose, private subnet, no
   public IP, no key pair, no inbound SG rules, least-privilege scheduler role
-  (EC2 + S3 + scoped PassRole). No resource in the topology is
-  internet-reachable.
+  (EC2 + S3 + scoped PassRole + SSM parameter reads). No resource in the
+  topology is internet-reachable. The stack also creates the results bucket
+  (public access blocked, lifecycle orphan-expiry) unless given an existing
+  one; the worker stack publishes its launch-template id to SSM Parameter
+  Store, and the gateway config resolves `ssm:/...` references — onboarding is
+  two create-stack calls plus a compose-up with no transcribed ids.
 - Sandbox compose stack (`deploy/compose/docker-compose.sandbox.yml`):
   gateway + scheduler + Postgres + one-shot Alembic migrate.
 - Account onboarding runbook (`docs/ONBOARDING_A_NEW_ACCOUNT.md`): network

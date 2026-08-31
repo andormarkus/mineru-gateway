@@ -1,6 +1,6 @@
-# mineru-gateway sandbox stack — gateway + scheduler + Postgres on one host.
+# mineru-gateway sandbox stack — gateway + scheduler + Postgres on the controller.
 #
-# Runs on the EC2 host created by deploy/cloudformation/gateway-host.yaml.
+# Runs on the EC2 controller created by deploy/cloudformation/controller.yaml.
 # The host's security group has no inbound rules; reach the gateway with an SSM
 # port-forwarding session (see README "Sandbox deployment"):
 #

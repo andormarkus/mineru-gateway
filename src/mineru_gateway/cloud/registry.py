@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 from mineru_gateway.cloud.aws.ec2 import AwsEc2Provider
 from mineru_gateway.cloud.aws.s3 import S3ObjectStore
+from mineru_gateway.cloud.aws.ssm import resolve_cloud_config
 from mineru_gateway.cloud.base import CloudStorageProvider, ComputeProvider
 from mineru_gateway.config import GatewaySettings
 from mineru_gateway.startup_guard import StartupDependencyError
@@ -20,7 +21,9 @@ _COMPUTE_FACTORIES: dict[str, ProviderFactory] = {
     "aws": lambda settings: AwsEc2Provider(
         region=settings.cloud.aws.region,
         endpoint_url=settings.cloud.aws.ec2_endpoint_url,
-        cloud=settings.cloud,
+        # Resolve ssm:/ launch-template references once, here, so the provider
+        # always sees a concrete lt-... id.
+        cloud=resolve_cloud_config(settings.cloud),
         deployment_id=settings.deployment_id,
     )
 }

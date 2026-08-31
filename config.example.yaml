@@ -81,6 +81,8 @@ cloud:
     endpoint_url: "http://localhost:8333"
     # EC2: moto/local only; omit ec2_endpoint_url for AWS EC2 in prod.
     ec2_endpoint_url: null
+    # Either a literal "lt-..." id, or an SSM Parameter Store reference the
+    # worker stack publishes: "ssm:/mineru-gateway/<environment>/launch-template-id".
     launch_template_id: null
     launch_template_version: "$Latest"
     # Workers live in private subnets; the scheduler reaches them via private

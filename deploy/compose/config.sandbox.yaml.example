@@ -57,8 +57,11 @@ cloud:
   provider: "aws"
   aws:
     region: "eu-central-1"
-    bucket: "REQUIRED ResultsBucket from the worker stack"
-    launch_template_id: "REQUIRED LaunchTemplateId from the worker stack"
+    # ResultsBucketName output of the controller stack.
+    bucket: "REQUIRED ResultsBucketName from the controller stack"
+    # The worker stack publishes the launch template id to Parameter Store —
+    # no copy-pasting of lt- ids.
+    launch_template_id: "ssm:/mineru-gateway/sandbox/launch-template-id"
     launch_template_version: "$Latest"
-    # Workers in private subnets — this host reaches them via private IPs;
-    # their SG allows 8000/8001 from this host's SG only. No public mode.
+    # Workers in private subnets — this controller reaches them via private
+    # IPs; their SG allows 8000/8001 from this controller's SG only. No public mode.
