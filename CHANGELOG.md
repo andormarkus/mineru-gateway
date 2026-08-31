@@ -26,6 +26,9 @@ sandbox deployment repeatable over SSM with a closed topology.
   inbound SG rules, least-privilege scheduler role (EC2 + S3 + scoped PassRole).
 - Sandbox compose stack (`deploy/compose/docker-compose.sandbox.yml`):
   gateway + scheduler + Postgres + one-shot Alembic migrate.
+- Account onboarding runbook (`docs/ONBOARDING_A_NEW_ACCOUNT.md`): network
+  (public/private subnets + NAT), S3 bucket + lifecycle rules, GPU quota
+  request, both CF stacks, cost map, and full teardown.
 - Test tiers: `tests/slow` (real worker) and `tests/e2e` (real AWS EC2,
   opt-in via `MINERU_GATEWAY_E2E=1`, costs money), shared harness in
   `tests/helpers/`, sample PDF fixtures.

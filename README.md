@@ -273,7 +273,10 @@ Provision the worker infrastructure with the CloudFormation stacks in
 
 The v1 sandbox topology: everything private, zero inbound ports, operated via
 SSM Session Manager. The whole stack is repeatable — launch, deploy, iterate,
-remove.
+remove. **Starting from an empty AWS account?** Do
+[`docs/ONBOARDING_A_NEW_ACCOUNT.md`](docs/ONBOARDING_A_NEW_ACCOUNT.md) first —
+network (public + private subnets with NAT), the S3 bucket + lifecycle rules,
+and the GPU quota request that gates everything.
 
 ```
  ┌───────────────────────────── VPC ─────────────────────────────┐
@@ -439,6 +442,13 @@ When `attribution.enabled: true` (default), every response includes:
 - `MinerU-Version: <upstream version>`
 
 `/health` and `GET /` also expose an `upstream` block with name, version, and homepage.
+
+## Docs
+
+- [`docs/ONBOARDING_A_NEW_ACCOUNT.md`](docs/ONBOARDING_A_NEW_ACCOUNT.md) — from an empty AWS account to a running stack (network, bucket, GPU quota, both CF stacks, teardown)
+- [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) — accepted edge cases and operational safeguards
+- [`docs/REQUIRED_CHANGES_BEFORE_SHIPPING.md`](docs/REQUIRED_CHANGES_BEFORE_SHIPPING.md) — the v0.1.0 ship gate, as shipped
+- [`docs/ideas/ship-v1.md`](docs/ideas/ship-v1.md) — the scoping one-pager behind v0.1.0
 
 ## Known limitations
 
