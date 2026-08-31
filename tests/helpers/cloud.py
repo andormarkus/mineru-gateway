@@ -91,7 +91,6 @@ class E2eCloudConfig:
     launch_template_id: str
     launch_template_version: str
     bucket: str
-    worker_address: str
     min_workers: int
     max_workers: int
     target_per_worker: int
@@ -112,7 +111,6 @@ def load_e2e_cloud_config(*, database_url: str) -> E2eCloudConfig | None:
         launch_template_id=launch_template_id,
         launch_template_version=os.environ.get("MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_VERSION", "$Latest").strip(),
         bucket=bucket,
-        worker_address=os.environ.get("MINERU_GATEWAY_CLOUD__AWS__WORKER_ADDRESS", "public").strip(),
         min_workers=_env_int("MINERU_GATEWAY_SCALING__MIN_WORKERS", 1),
         max_workers=_env_int("MINERU_GATEWAY_SCALING__MAX_WORKERS", 1),
         target_per_worker=_env_int("MINERU_GATEWAY_SCALING__TARGET_PER_WORKER", ScalingConfig().target_per_worker),
@@ -133,7 +131,6 @@ def apply_e2e_env(monkeypatch: pytest.MonkeyPatch, cfg: E2eCloudConfig) -> None:
     monkeypatch.setenv("MINERU_GATEWAY_CLOUD__AWS__BUCKET", cfg.bucket)
     monkeypatch.setenv("MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_ID", cfg.launch_template_id)
     monkeypatch.setenv("MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_VERSION", cfg.launch_template_version)
-    monkeypatch.setenv("MINERU_GATEWAY_CLOUD__AWS__WORKER_ADDRESS", cfg.worker_address)
     monkeypatch.delenv("MINERU_GATEWAY_CLOUD__AWS__ENDPOINT_URL", raising=False)
     monkeypatch.delenv("MINERU_GATEWAY_CLOUD__AWS__EC2_ENDPOINT_URL", raising=False)
     monkeypatch.setenv("MINERU_GATEWAY_SCALING__MIN_WORKERS", str(cfg.min_workers))
@@ -160,7 +157,6 @@ def prime_e2e_cloud_env(cfg: E2eCloudConfig) -> None:
     os.environ["MINERU_GATEWAY_CLOUD__AWS__BUCKET"] = cfg.bucket
     os.environ["MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_ID"] = cfg.launch_template_id
     os.environ["MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_VERSION"] = cfg.launch_template_version
-    os.environ["MINERU_GATEWAY_CLOUD__AWS__WORKER_ADDRESS"] = cfg.worker_address
     os.environ["MINERU_GATEWAY_SCALING__MIN_WORKERS"] = str(cfg.min_workers)
     os.environ["MINERU_GATEWAY_SCALING__MAX_WORKERS"] = str(cfg.max_workers)
     os.environ["MINERU_GATEWAY_SCALING__TARGET_PER_WORKER"] = str(cfg.target_per_worker)
@@ -204,7 +200,6 @@ def build_e2e_settings(cfg: E2eCloudConfig) -> GatewaySettings:
                 "bucket": cfg.bucket,
                 "launch_template_id": cfg.launch_template_id,
                 "launch_template_version": cfg.launch_template_version,
-                "worker_address": cfg.worker_address,
                 "endpoint_url": None,
                 "ec2_endpoint_url": None,
             },

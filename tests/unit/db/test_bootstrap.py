@@ -22,7 +22,6 @@ async def test_ensure_sqlite_schema_creates_workers_table() -> None:
         launch_template_id="lt-x",
         launch_template_version="$Latest",
         bucket="bucket",
-        worker_address="public",
         min_workers=0,
         max_workers=1,
         target_per_worker=2,

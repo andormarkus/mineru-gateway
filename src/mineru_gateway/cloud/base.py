@@ -45,10 +45,6 @@ class ComputeProvider(ABC):
     async def get_private_ip(self, instance_id: str) -> str | None:
         """Return private IPv4 for worker base_url, or None if not assigned."""
 
-    @abstractmethod
-    async def get_public_ip(self, instance_id: str) -> str | None:
-        """Return public IPv4 for worker base_url, or None if not assigned."""
-
 
 class CloudStorageProvider(ABC):
     """Abstract cloud object/blob store — payloads and results."""

@@ -83,8 +83,8 @@ cloud:
     ec2_endpoint_url: null
     launch_template_id: null
     launch_template_version: "$Latest"
-    # private (default): workers in private subnet; public: workers with public IP.
-    worker_address: "private"
+    # Workers live in private subnets; the scheduler reaches them via private
+    # IPs. There is no public-worker mode.
 
 attribution:
   # MinerU LICENSE §2: online services built on MinerU must clearly indicate

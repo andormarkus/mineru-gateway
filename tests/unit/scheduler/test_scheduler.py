@@ -307,9 +307,6 @@ class _FakeProvider(ComputeProvider):
     async def get_private_ip(self, instance_id: str) -> str | None:
         return "10.0.0.1"
 
-    async def get_public_ip(self, instance_id: str) -> str | None:
-        return "203.0.113.1"
-
     async def start(self, instance_id: str) -> None:
         return None
 
@@ -405,25 +402,23 @@ async def test_reconcile_terminates_duplicate_vms(db_session: AsyncSession) -> N
 
 
 @pytest.mark.asyncio
-async def test_reconcile_sets_public_base_url(db_session: AsyncSession) -> None:
-    reset_settings_cache()
-    settings = load_settings(cloud={"provider": "aws", "aws": {"worker_address": "public"}})
-    await _seed_worker(db_session, "pub-1", base_url=None, instance_id="i-pub-1")
+async def test_reconcile_sets_private_base_url(db_session: AsyncSession) -> None:
+    await _seed_worker(db_session, "worker-1", base_url=None, instance_id="i-worker-1")
     await db_session.close()
 
     client = httpx.AsyncClient()
     try:
         scheduler = Scheduler(
-            settings=settings, store=InMemoryStore(name="test"), client=client, provider=_FakeProvider()
+            settings=get_settings(), store=InMemoryStore(name="test"), client=client, provider=_FakeProvider()
         )
         await scheduler._reconcile_workers()
     finally:
         await client.aclose()
 
     async with get_db_session() as session:
-        row = await session.get(Worker, "pub-1")
+        row = await session.get(Worker, "worker-1")
     assert row is not None
-    assert row.base_url == "http://203.0.113.1:8000"
+    assert row.base_url == "http://10.0.0.1:8000"
 
 
 @pytest.mark.asyncio

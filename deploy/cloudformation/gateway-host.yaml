@@ -31,7 +31,6 @@ Metadata:
           default: Permissions
         Parameters:
           - ResultsBucket
-          - WorkerRoleArn
       - Label:
           default: Naming
         Parameters:
@@ -80,12 +79,6 @@ Parameters:
     Type: String
     Description: S3 bucket for payloads/results (must match cloud.aws.bucket in gateway config).
 
-  WorkerRoleArn:
-    Type: String
-    Description: >
-      IAM role behind the worker instance profile (output WorkerInstanceProfileArn's role).
-      The scheduler needs iam:PassRole on exactly this role to launch workers.
-
 Resources:
   HostInstanceRole:
     Type: AWS::IAM::Role
@@ -123,13 +116,6 @@ Resources:
               - ec2:DescribeInstances
               - ec2:DescribeInstanceTypes
             Resource: "*"
-          - Sid: PassWorkerRoleOnLaunch
-            Effect: Allow
-            Action: iam:PassRole
-            Resource: !Ref WorkerRoleArn
-            Condition:
-              StringEquals:
-                iam:PassedToService: ec2.amazonaws.com
           - Sid: ResultsBucketAccess
             Effect: Allow
             Action:
@@ -224,6 +210,8 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-SecurityGroupId"
 
-  RoleArn:
-    Description: Host role (SSM + scheduler EC2/S3 + PassRole on worker role).
-    Value: !GetAtt HostInstanceRole.Arn
+  RoleName:
+    Description: >
+      Host role name — pass as HostRoleName to the worker stack (it grants this role
+      iam:PassRole on the worker role it creates).
+    Value: !Ref HostInstanceRole

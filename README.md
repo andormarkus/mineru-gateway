@@ -252,8 +252,9 @@ cloud:
     bucket: mineru-results
     launch_template_id: lt-0abc123
     launch_template_version: "$Latest"
-    worker_address: private        # private (default) | public
 ```
+
+Workers are addressed **by private IP only** — there is no public-worker mode. The scheduler must run in the same VPC as the workers (the sandbox host is).
 
 Workers are stock upstream `mineru-api` instances — nothing registers with the
 gateway. The scheduler launches them via the launch template, discovers them by
@@ -263,10 +264,9 @@ while they build, dispatches tasks, and terminates them when idle.
 Provision the worker infrastructure with the CloudFormation stacks in
 `deploy/cloudformation/`:
 
-| Template | Topology |
-|----------|----------|
-| `mineru-worker.yaml` | Workers in a **private subnet**, no public IPs. The gateway/scheduler SG gets access to `:8000`/`:8001`. |
-| `mineru-worker-public.yaml` | Workers with public IPs + CIDR allow-list. What the e2e tier runs against; useful when the scheduler runs outside the VPC. |
+| Template | Purpose |
+|----------|---------|
+| `mineru-worker.yaml` | Worker launch template, IAM role, and SG: workers in a **private subnet**, no public IPs, `:8000`/`:8001` reachable only from the gateway-host SG. |
 | `gateway-host.yaml` | The host that runs gateway + scheduler + Postgres (see below). |
 
 ### Sandbox deployment (SSM, closed topology)
@@ -289,24 +289,9 @@ remove.
         operator laptop                       results bucket
 ```
 
-**1 — Worker stack** (once per environment; needs the host SG for ingress, so
-create the host stack first and pass its `SecurityGroupId` output):
-
-```bash
-aws cloudformation create-stack --stack-name mineru-worker-sandbox \
-  --template-body file://deploy/cloudformation/mineru-worker.yaml \
-  --parameters \
-    ParameterKey=VpcId,ParameterValue=vpc-... \
-    ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
-    ParameterKey=GatewaySecurityGroupId,ParameterValue=<gateway-host SecurityGroupId> \
-    ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
-    ParameterKey=EnvironmentName,ParameterValue=sandbox \
-  --capabilities CAPABILITY_NAMED_IAM
-# Note the LaunchTemplateId output and the worker role ARN (behind
-# WorkerInstanceProfileArn) — both go into the host stack.
-```
-
-**2 — Host stack** (the SSM-operated dev machine; ~$0.04/hr t4g.medium):
+**1 — Host stack** (the SSM-operated dev machine; ~$0.04/hr t4g.medium).
+Create this first — the worker stack grants its SG ingress and the
+`iam:PassRole` permission to this host's role:
 
 ```bash
 aws cloudformation create-stack --stack-name mineru-gateway-host \
@@ -315,9 +300,26 @@ aws cloudformation create-stack --stack-name mineru-gateway-host \
     ParameterKey=VpcId,ParameterValue=vpc-... \
     ParameterKey=PublicSubnetId,ParameterValue=subnet-... \
     ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
-    ParameterKey=WorkerRoleArn,ParameterValue=arn:aws:iam::...:role/sandbox-mineru-gateway-worker \
     ParameterKey=EnvironmentName,ParameterValue=sandbox \
   --capabilities CAPABILITY_NAMED_IAM
+# Note the SecurityGroupId and RoleName outputs.
+```
+
+**2 — Worker stack** (private subnets only; takes the host SG and host role
+from step 1):
+
+```bash
+aws cloudformation create-stack --stack-name mineru-worker-sandbox \
+  --template-body file://deploy/cloudformation/mineru-worker.yaml \
+  --parameters \
+    ParameterKey=VpcId,ParameterValue=vpc-... \
+    ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
+    ParameterKey=GatewaySecurityGroupId,ParameterValue=<host SecurityGroupId> \
+    ParameterKey=HostRoleName,ParameterValue=<host RoleName> \
+    ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
+    ParameterKey=EnvironmentName,ParameterValue=sandbox \
+  --capabilities CAPABILITY_NAMED_IAM
+# Note the LaunchTemplateId output — it goes into the gateway config.
 ```
 
 **3 — Deploy the stack over SSM** (no SSH, no keys, no open ports):

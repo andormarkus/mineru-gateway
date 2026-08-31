@@ -361,8 +361,7 @@ class Scheduler:
         return None
 
     async def _worker_connect_ip(self, provider: ComputeProvider, instance_id: str) -> str | None:
-        if self._settings.cloud.aws.worker_address == "public":
-            return await provider.get_public_ip(instance_id)
+        """Workers are addressed by private IP only — they live in private subnets."""
         return await provider.get_private_ip(instance_id)
 
     async def _check_running_readiness(self, worker: Worker, provider: ComputeProvider) -> bool:

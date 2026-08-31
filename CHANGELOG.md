@@ -53,6 +53,11 @@ sandbox deployment repeatable over SSM with a closed topology.
 ### Removed
 - Stray experimental `Dockerfile.1` (unreferenced copy of upstream MinerU's
   GPU image; the worker CF builds from upstream at boot instead).
+- **Public worker mode, entirely.** Workers are addressed by private IP only:
+  `cloud.aws.worker_address` config, `ComputeProvider.get_public_ip()`, and
+  the public-worker CloudFormation template are gone. The scheduler must run
+  in the workers' VPC (the sandbox host does). Breaking for configs still
+  carrying `worker_address` (`extra="forbid"` fails fast at startup).
 
 ## [Unreleased → 0.1.0 base]
 

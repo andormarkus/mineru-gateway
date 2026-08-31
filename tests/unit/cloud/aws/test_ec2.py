@@ -180,22 +180,6 @@ async def test_idempotent_terminate(ec2_provider: AwsEc2Provider, moto_ec2_endpo
 
 
 @pytest.mark.asyncio
-async def test_get_public_ip(ec2_provider: AwsEc2Provider, moto_ec2_endpoint: str) -> None:
-    ec2 = _boto3_sync(moto_ec2_endpoint)
-    resp = ec2.run_instances(ImageId="ami-test", InstanceType="t2.micro", MinCount=1, MaxCount=1)
-    instance_id = resp["Instances"][0]["InstanceId"]
-
-    ip = await ec2_provider.get_public_ip(instance_id)
-    # moto may omit PublicIpAddress unless explicitly associated; method must not raise.
-    assert ip is None or isinstance(ip, str)
-
-
-@pytest.mark.asyncio
-async def test_get_public_ip_missing_instance_returns_none(ec2_provider: AwsEc2Provider) -> None:
-    assert await ec2_provider.get_public_ip("i-nonexistent") is None
-
-
-@pytest.mark.asyncio
 async def test_get_private_ip(ec2_provider: AwsEc2Provider, moto_ec2_endpoint: str) -> None:
     ec2 = _boto3_sync(moto_ec2_endpoint)
     resp = ec2.run_instances(ImageId="ami-test", InstanceType="t2.micro", MinCount=1, MaxCount=1)

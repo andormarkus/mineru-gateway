@@ -22,8 +22,10 @@ Prerequisites:
   export AWS_PROFILE=your-profile
   export MINERU_GATEWAY_CLOUD__AWS__LAUNCH_TEMPLATE_ID=lt-...
   export MINERU_GATEWAY_CLOUD__AWS__BUCKET=your-bucket
-  export MINERU_GATEWAY_CLOUD__AWS__WORKER_ADDRESS=public
   export MINERU_GATEWAY_DEPLOYMENT_ID=e2e-pytest
+
+Run from a machine INSIDE the VPC (the gateway-host works well): workers are
+addressed by private IP only, so the scheduler must share the VPC with them.
 
 Run smoke:  ``task test-e2e-smoke``
 Run scheduler: ``task test-e2e-scheduler``

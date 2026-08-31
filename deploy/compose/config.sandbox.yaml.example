@@ -60,6 +60,5 @@ cloud:
     bucket: "REQUIRED ResultsBucket from the worker stack"
     launch_template_id: "REQUIRED LaunchTemplateId from the worker stack"
     launch_template_version: "$Latest"
-    # Workers in private subnets — the scheduler (this host) reaches them via
-    # private IPs; their SG allows 8000/8001 from this host's SG only.
-    worker_address: "private"
+    # Workers in private subnets — this host reaches them via private IPs;
+    # their SG allows 8000/8001 from this host's SG only. No public mode.
