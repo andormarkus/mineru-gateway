@@ -3,6 +3,10 @@ Description: >
   mineru-gateway host — one small always-on EC2 instance that runs the gateway + scheduler +
   Postgres via docker compose (deploy/compose/docker-compose.sandbox.yml).
 
+  The host runs in a PRIVATE subnet with no public IP — the whole data plane is private. Its
+  egress (SSM agent, docker pulls, git, S3) goes via the VPC's NAT gateway; alternatively give
+  the subnet SSM VPC endpoints (ssm, ssmmessages, ec2messages) plus an S3 gateway endpoint.
+
   Access is SSM Session Manager ONLY: no key pair, no SSH port, and the security group has NO
   inbound rules. The SSM agent on the instance dials out to the SSM service.
 
@@ -21,7 +25,7 @@ Metadata:
           default: Network
         Parameters:
           - VpcId
-          - PublicSubnetId
+          - PrivateSubnetId
       - Label:
           default: Instance
         Parameters:
@@ -41,11 +45,11 @@ Parameters:
     Type: AWS::EC2::VPC::Id
     Description: VPC for the host. Workers must launch in the same VPC.
 
-  PublicSubnetId:
+  PrivateSubnetId:
     Type: AWS::EC2::Subnet::Id
     Description: >
-      Public subnet with an internet route (no NAT dependency: the host keeps a public IP but
-      its security group is fully closed — the SSM agent and docker outbound are enough).
+      Private subnet with a NAT route (or SSM/S3 VPC endpoints). The host gets NO public IP —
+      no resource in this topology is internet-reachable.
 
   InstanceType:
     Type: String
@@ -162,11 +166,12 @@ Resources:
       ImageId: !Ref AmiId
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref HostInstanceProfile
-      SubnetId: !Ref PublicSubnetId
+      SubnetId: !Ref PrivateSubnetId
       SecurityGroupIds:
         - !Ref HostSecurityGroup
       # Deliberately NO KeyName: SSM Session Manager is the only way in.
-      AssociatePublicIpAddress: true
+      # Deliberately NO public IP: the host lives in a private subnet.
+      AssociatePublicIpAddress: false
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:

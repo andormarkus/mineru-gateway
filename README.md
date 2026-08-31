@@ -279,18 +279,25 @@ network (public + private subnets with NAT), the S3 bucket + lifecycle rules,
 and the GPU quota request that gates everything.
 
 ```
- ┌───────────────────────────── VPC ─────────────────────────────┐
- │ public subnet                      private subnet            │
- │ ┌────────────────────┐             ┌───────────────────────┐  │
- │ │ gateway host (t4g) │──8000/8001──▶ GPU workers (g5/g6)   │  │
- │ │ gateway+scheduler  │             │ stock mineru-api      │  │
- │ │ postgres (compose) │             │ scale 0..2, idle-drain│  │
- │ └─────────┬──────────┘             └───────────┬───────────┘  │
- │           │ no inbound SG                      │ S3           │
- └───────────┼─────────────────────────────────────┼──────────────┘
-             │ SSM (outbound)                      │
-        operator laptop                       results bucket
+ ┌──────────────────────────────── VPC ────────────────────────────────┐
+ │ public subnet (NAT only)           private subnets                 │
+ │ ┌───────────────┐                  ┌────────────────┐ ┌─────────┐ │
+ │ │ NAT gateway   │◀──── egress ──────│ gateway host   │ │ GPU     │ │
+ │ └───────────────┘                  │ gateway+worker │─▶ workers │ │
+ │                no public IPs:      │ scheduler, pg  │ │ g5/g6,  │ │
+ │                everything below    │ (t4g, compose) │ │ 0..2    │ │
+ │                runs in private     └───────┬────────┘ └────┬────┘ │
+ │                subnets                     │ 8000/8001 only│ S3    │
+ └───────────────┼────────────────────────────┼───────────────┼──────┘
+                 │ SSM agent outbound 443     │               │
+            operator laptop            results bucket ◀───────┘
 ```
+
+**How do you reach a host with no public IP?** The SSM agent on the instance
+opens an *outbound* TLS connection to the AWS SSM service; `aws ssm
+start-session` talks to that same service, which relays your session through
+it. Nothing ever connects inbound to the host — that is why its security
+group has no inbound rules and why it can sit in a private subnet.
 
 **1 — Host stack** (the SSM-operated dev machine; ~$0.04/hr t4g.medium).
 Create this first — the worker stack grants its SG ingress and the
@@ -301,7 +308,7 @@ aws cloudformation create-stack --stack-name mineru-gateway-host \
   --template-body file://deploy/cloudformation/gateway-host.yaml \
   --parameters \
     ParameterKey=VpcId,ParameterValue=vpc-... \
-    ParameterKey=PublicSubnetId,ParameterValue=subnet-... \
+    ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
     ParameterKey=ResultsBucket,ParameterValue=andor-sandbox-... \
     ParameterKey=EnvironmentName,ParameterValue=sandbox \
   --capabilities CAPABILITY_NAMED_IAM

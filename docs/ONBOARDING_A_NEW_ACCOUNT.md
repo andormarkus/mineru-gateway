@@ -21,30 +21,35 @@ export AWS_REGION=eu-central-1          # pick one and stay in it
 
 | Requirement | Why |
 |---|---|
-| VPC with ≥1 public subnet (IGW route) | gateway host: SSM dials out, docker pulls |
-| ≥1 private subnet (NAT route) | workers: first boot pulls vLLM base image + models; no public IPs |
+| ≥1 private subnet (NAT route) | gateway host AND workers: SSM agent dials out, docker pulls, first boot pulls vLLM base image + models |
+| ≥1 public subnet | hosts the NAT gateway only — no instance lives there |
 | S3 bucket | payloads, results, dedup cache |
 | `L-DB27BBAB` quota ≥ 8 vCPUs (g5/g6) | **new accounts default to 0 GPU vCPUs — request early, approval can take hours–days** |
-| SSM agent connectivity | AL2023 AMIs ship it; just needs outbound 443 (IGW or NAT) |
+| SSM agent connectivity | AL2023 AMIs ship it; it only needs outbound 443 via the NAT (or SSM VPC endpoints) |
 
-## 1. Network (skip if your VPC already has public + private subnets)
+No resource in this topology gets a public IP — the host and the workers all
+run in private subnets, and operators reach the host through SSM Session
+Manager (the agent's outbound connection), never inbound.
 
-Workers launch with `AssociatePublicIpAddress: false` into a private subnet,
-so they need a NAT gateway for their first boot. If the account has only the
-default VPC, the minimal layout is:
+## 1. Network (skip if your VPC already has private subnets with a NAT route)
+
+Both the gateway host and the workers run in private subnets with no public
+IPs; their egress (SSM, docker, git, model downloads) flows through one NAT
+gateway, which is the only thing living in the public subnet. If the account
+has only the default VPC, the minimal layout is:
 
 ```bash
 VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true \
   --query 'Vpcs[0].VpcId' --output text)
 
-# Elastic IP + NAT gateway in the first public subnet
+# Elastic IP + NAT gateway in the first public subnet (the ONLY thing there)
 PUB_SUBNET=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID \
   Name=map-public-on-launch,Values=true --query 'Subnets[0].SubnetId' --output text)
 EIP=$(aws ec2 allocate-address --query AllocationId --output text)
 NAT=$(aws ec2 create-nat-gateway --subnet-id $PUB_SUBNET \
   --allocation-id $EIP --query 'NatGateway.NatGatewayId' --output text)
 
-# A private subnet + route via NAT (skip if one exists)
+# A private subnet + route via NAT — gateway host and workers both live here
 PRIV_SUBNET=$(aws ec2 create-subnet --vpc-id $VPC_ID \
   --cidr-block <a free /24> --query 'Subnet.SubnetId' --output text)
 RTB=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
@@ -58,7 +63,9 @@ data). Keep it if workers boot often; delete it and keep only warm golden AMIs
 when the environment goes quiet.
 
 If you use your own VPC, verify: `aws ec2 describe-route-tables` shows the
-private subnet routed via the NAT and the public subnet via the IGW.
+private subnet routed via the NAT. (Alternative to a NAT: SSM interface
+endpoints `ssm`, `ssmmessages`, `ec2messages` + the free S3 gateway endpoint —
+more setup, no per-GB NAT charges.)
 
 ## 2. S3 bucket + lifecycle safety net
 
@@ -101,14 +108,16 @@ fail with `InsufficientInstanceCapacity`/quota errors — visible in
 ## 4. Host stack
 
 The host (t4g.medium, ~$0.04/hr) is created first — the worker stack grants
-its SG ingress and `iam:PassRole` to the host role:
+its SG ingress and `iam:PassRole` to the host role. It launches into the
+private subnet with **no public IP**; SSM reaches it through the agent's
+outbound connection:
 
 ```bash
 aws cloudformation create-stack --stack-name mineru-gateway-host \
   --template-body file://deploy/cloudformation/gateway-host.yaml \
   --parameters \
     ParameterKey=VpcId,ParameterValue=$VPC_ID \
-    ParameterKey=PublicSubnetId,ParameterValue=$PUB_SUBNET \
+    ParameterKey=PrivateSubnetId,ParameterValue=$PRIV_SUBNET \
     ParameterKey=ResultsBucket,ParameterValue=$BUCKET \
     ParameterKey=EnvironmentName,ParameterValue=sandbox \
   --capabilities CAPABILITY_NAMED_IAM

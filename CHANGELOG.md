@@ -22,8 +22,10 @@ sandbox deployment repeatable over SSM with a closed topology.
   `ComputeProvider.get_public_ip()`.
 - Worker CloudFormation stacks (`deploy/cloudformation/mineru-worker*.yaml`)
   with full GPU bootstrap user-data and the status responder.
-- SSM-operated gateway host stack (`gateway-host.yaml`): no key pair, no
-  inbound SG rules, least-privilege scheduler role (EC2 + S3 + scoped PassRole).
+- SSM-operated gateway host stack (`gateway-host.yaml`): private subnet, no
+  public IP, no key pair, no inbound SG rules, least-privilege scheduler role
+  (EC2 + S3 + scoped PassRole). No resource in the topology is
+  internet-reachable.
 - Sandbox compose stack (`deploy/compose/docker-compose.sandbox.yml`):
   gateway + scheduler + Postgres + one-shot Alembic migrate.
 - Account onboarding runbook (`docs/ONBOARDING_A_NEW_ACCOUNT.md`): network
