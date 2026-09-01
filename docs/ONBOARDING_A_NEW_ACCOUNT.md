@@ -24,7 +24,7 @@ export AWS_REGION=eu-central-1          # pick one and stay in it
 |---|---|
 | ≥1 private subnet (NAT route) | controller AND workers: SSM agent dials out, docker pulls, first boot pulls vLLM base image + models |
 | ≥1 public subnet | hosts the NAT gateway only — no instance lives there |
-| `L-DB27BBAB` quota ≥ 8 vCPUs (g5/g6) | the one thing no CloudFormation stack can do (see below) |
+| `L-DB2E81BA` quota ≥ 8 vCPUs (g5/g6) | the one thing no CloudFormation stack can do (see below) |
 
 No resource in this topology gets a public IP — the controller and the
 workers all run in private subnets, and operators reach the controller
@@ -39,7 +39,7 @@ stack. Approval commonly takes hours, sometimes days:
 
 ```bash
 aws service-quotas get-service-quota --service-code ec2 \
-  --quota-code L-DB27BBAB --query 'Quota.Value' --output text
+  --quota-code L-DB2E81BA --query 'Quota.Value' --output text
 # if 0 → request an increase (console: Service Quotas → EC2 →
 # "Running On-Demand G and VT instances", or request-service-quota-increase)
 ```

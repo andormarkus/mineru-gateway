@@ -14,7 +14,7 @@ Description: >
   The controller's security group is what worker stacks reference: workers in private subnets
   accept :8000 (mineru-api) and :8001 (bootstrap status) only from this group.
 
-  The one thing this stack cannot do: raise GPU service quota (L-DB27BBAB) — AWS requires an
+  The one thing this stack cannot do: raise GPU service quota (L-DB2E81BA) — AWS requires an
   account-side approval; request it separately, ideally before deploying. New accounts start at 0.
 
   Launch → deploy → iterate → remove:

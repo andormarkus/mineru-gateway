@@ -269,7 +269,7 @@ Provision the infrastructure with the CloudFormation stacks in
 | `controller.yaml` | **The controller** — the control plane: t4g instance running gateway + scheduler + Postgres (compose), plus (by default) the results S3 bucket with lifecycle rules. Private subnet, SSM-only, zero inbound. |
 | `mineru-worker.yaml` | Worker launch template, IAM role, SG: workers in a **private subnet**, no public IPs, `:8000`/`:8001` reachable only from the controller SG. Publishes the launch-template id to SSM Parameter Store. |
 
-The worker stack cannot raise GPU service quota (`L-DB27BBAB`) for you — no
+The worker stack cannot raise GPU service quota (`L-DB2E81BA`) for you — no
 CloudFormation stack can; it needs account-side approval (see onboarding).
 
 ### Sandbox deployment (SSM, closed topology)
