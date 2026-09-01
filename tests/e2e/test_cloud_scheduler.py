@@ -215,28 +215,35 @@ async def test_04b_stopped_worker_resume_on_demand(
             for w in ws
         )
 
-    # Wait for the idle stop to COMPLETE (test_04 may only have seen the drain
-    # begin). The full transition — drain initiation, EC2 stop, state poll —
-    # stretches over several minutes, and the autoscaler drains workers serially.
-    await wait_for_admin_workers(
-        client,
-        predicate=fully_stopped,
-        timeout_seconds=600.0,
-        poll_interval=poll,
-        description="a worker fully stopped (warm pool)",
-    )
-    workers = await fetch_admin_workers(client)
-    stopped = [
-        w
-        for w in workers
-        if w.get("desired_state") == "stopped" and w.get("cloud_state") == "stopped" and w.get("instance_id")
-    ]
-    warm = stopped[0]
-    warm_instance = warm.get("instance_id")
-    e2e_log(f"warm-resume test: resuming {warm['id'][:8]} instance={warm_instance}", always=True)
     started = asyncio.get_running_loop().time()
 
+    # The stop only progresses while a scheduler loop is running — the drain
+    # advance and provider.stop() are scheduler actions — so the wait must live
+    # INSIDE the loop context. Waiting outside deadlocks it (the state cannot
+    # advance without the scheduler).
     async with _e2e_scheduler(settings, store, client_timeout=e2e_worker_timeout_seconds):
+        await wait_for_admin_workers(
+            client,
+            predicate=fully_stopped,
+            timeout_seconds=600.0,
+            poll_interval=poll,
+            description="a worker fully stopped (warm pool)",
+        )
+        workers = await fetch_admin_workers(client)
+        stopped = [
+            w
+            for w in workers
+            if w.get("desired_state") == "stopped" and w.get("cloud_state") == "stopped" and w.get("instance_id")
+        ]
+        warm = stopped[0]
+        warm_instance = warm.get("instance_id")
+        stop_wait = asyncio.get_running_loop().time() - started
+        e2e_log(
+            f"warm-resume test: {warm['id'][:8]} fully stopped (+{stop_wait:.0f}s); resuming instance={warm_instance}",
+            always=True,
+        )
+
+        resume_started = asyncio.get_running_loop().time()
         task_id = await submit_pdf_task(client, filename=_PDF_NAME, pdf_bytes=_PDF_BYTES)
 
         def resumed_in_place(ws: list[dict]) -> bool:
@@ -249,6 +256,7 @@ async def test_04b_stopped_worker_resume_on_demand(
             poll_interval=poll,
             description=f"warm worker {warm['id'][:8]} resumed in place",
         )
+        live_after = asyncio.get_running_loop().time() - resume_started
 
         await wait_for_task_status_api(
             client, task_id, expected="completed", timeout_seconds=e2e_worker_timeout_seconds, poll_interval=poll
@@ -259,8 +267,11 @@ async def test_04b_stopped_worker_resume_on_demand(
             f"warm resume must not create additional workers ({worker_count_before} -> {len(workers_after)})"
         )
 
-    elapsed = asyncio.get_running_loop().time() - started
-    e2e_log(f"warm resume of {warm_instance} serviceable + task completed in {elapsed:.0f}s", always=True)
+    e2e_log(
+        f"WARM RESUME TIMING: resume signal -> API live = {live_after:.0f}s; signal -> task completed = "
+        f"{asyncio.get_running_loop().time() - resume_started:.0f}s",
+        always=True,
+    )
 
 
 @pytest.mark.asyncio
