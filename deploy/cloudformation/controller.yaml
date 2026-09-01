@@ -221,8 +221,14 @@ Resources:
           set -euo pipefail
           exec > /var/log/controller-setup.log 2>&1
           dnf update -y
-          dnf install -y docker git curl
-          dnf install -y docker-compose-plugin
+          dnf install -y --allowerasing docker git curl
+          # AL2023 repos have no docker-compose-plugin — install compose v2 from upstream.
+          dnf install -y docker-compose-plugin || {
+            mkdir -p /usr/local/lib/docker/cli-plugins
+            curl -fsSL https://github.com/docker/compose/releases/download/v2.35.0/docker-compose-linux-aarch64 \
+              -o /usr/local/lib/docker/cli-plugins/docker-compose
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+          }
           systemctl enable --now docker
           usermod -aG docker ec2-user
           # SSM agent ships with AL2023 and needs no config with the managed policy attached.
