@@ -215,11 +215,13 @@ async def test_04b_stopped_worker_resume_on_demand(
             for w in ws
         )
 
-    # Wait for the idle stop to COMPLETE (test_04 may only have seen the drain begin).
+    # Wait for the idle stop to COMPLETE (test_04 may only have seen the drain
+    # begin). The full transition — drain initiation, EC2 stop, state poll —
+    # stretches over several minutes, and the autoscaler drains workers serially.
     await wait_for_admin_workers(
         client,
         predicate=fully_stopped,
-        timeout_seconds=settings.scaling.idle_cooldown_seconds + 120,
+        timeout_seconds=600.0,
         poll_interval=poll,
         description="a worker fully stopped (warm pool)",
     )
