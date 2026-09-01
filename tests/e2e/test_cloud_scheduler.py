@@ -203,12 +203,34 @@ async def test_04b_stopped_worker_resume_on_demand(
     poll = scheduler_poll_interval_seconds()
 
     workers = await fetch_admin_workers(client)
-    stopped = [w for w in workers if w.get("desired_state") == "stopped" and w.get("cloud_state") == "stopped"]
-    assert stopped, "test_04 must leave a stopped (warm) worker to resume"
+    with_instance = [w for w in workers if w.get("instance_id") and w.get("desired_state") != "terminated"]
+    assert with_instance, "need a non-terminated worker to exercise warm resume"
+    worker_count_before = len(workers)
+
+    def fully_stopped(ws: list[dict]) -> bool:
+        return any(
+            w.get("desired_state") == "stopped"
+            and w.get("cloud_state") == "stopped"
+            and w.get("instance_id")
+            for w in ws
+        )
+
+    # Wait for the idle stop to COMPLETE (test_04 may only have seen the drain begin).
+    await wait_for_admin_workers(
+        client,
+        predicate=fully_stopped,
+        timeout_seconds=settings.scaling.idle_cooldown_seconds + 120,
+        poll_interval=poll,
+        description="a worker fully stopped (warm pool)",
+    )
+    workers = await fetch_admin_workers(client)
+    stopped = [
+        w
+        for w in workers
+        if w.get("desired_state") == "stopped" and w.get("cloud_state") == "stopped" and w.get("instance_id")
+    ]
     warm = stopped[0]
     warm_instance = warm.get("instance_id")
-    assert warm_instance, "stopped worker must keep its instance_id for resume"
-    worker_count_before = len(workers)
     e2e_log(f"warm-resume test: resuming {warm['id'][:8]} instance={warm_instance}", always=True)
     started = asyncio.get_running_loop().time()
 
