@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  mineru-gateway controller — control plane: gateway API + scheduler + Postgres (docker compose)
+  on one private-subnet t4g instance, plus the results S3 bucket (public access blocked,
+  lifecycle orphan-expiry). No public IP, no key pair, zero inbound SG rules: access is SSM
+  Session Manager only (the agent dials out via the NAT route). Workers accept :8000/:8001 from
+  this SG only. Not automatable here: GPU quota L-DB2E81BA (On-Demand G/VT vCPUs) — request it
+  account-side. Operate: aws ssm start-session --target <InstanceId>.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - PrivateSubnetId
+      - Label:
+          default: Instance
+        Parameters:
+          - InstanceType
+          - RootVolumeSizeGiB
+      - Label:
+          default: Storage
+        Parameters:
+          - ResultsBucketName
+      - Label:
+          default: Naming
+        Parameters:
+          - EnvironmentName
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the controller. Workers must launch in the same VPC.
+
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Private subnet with a NAT route (or SSM/S3 VPC endpoints). The controller gets NO public
+      IP — no resource in this topology is internet-reachable.
+
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues:
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+      - t3.medium
+      - t3.large
+    Description: ARM (t4g) matches the default AL2023 arm64 AMI.
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 40
+    MinValue: 20
+    MaxValue: 200
+    Description: "Root volume: docker images, Postgres data, repo clone."
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: AL2023 (SSM agent + dnf). Must be arm64 for t4g types.
+
+  EnvironmentName:
+    Type: String
+    Default: sandbox
+    Description: Prefix for resource names; also scopes the SSM parameter namespace.
+
+  ResultsBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Existing bucket to use for payloads/results/cache. Leave empty to create
+      <account>-<environment>-mineru-results in this stack (with lifecycle rules).
+
+Conditions:
+  CreateBucket: !Equals [!Ref ResultsBucketName, ""]
+
+Resources:
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${EnvironmentName}-mineru-results"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-payloads
+            Prefix: payloads/
+            Status: Enabled
+            ExpirationInDays: 7
+          - Id: expire-results
+            Prefix: results/
+            Status: Enabled
+            ExpirationInDays: 90
+          - Id: expire-cache
+            Prefix: cache/
+            Status: Enabled
+            ExpirationInDays: 90
+
+  ControllerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mineru-gateway-controller"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-controller-role"
+
+  ControllerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: mineru-gateway-controller
+      Roles:
+        - !Ref ControllerInstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SchedulerControlsWorkers
+            Effect: Allow
+            Action:
+              - ec2:RunInstances
+              - ec2:StartInstances
+              - ec2:StopInstances
+              - ec2:TerminateInstances
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceTypes
+              - ec2:CreateTags
+            Resource: "*"
+          - Sid: PassWorkerRoleOnLaunch
+            Effect: Allow
+            Action: iam:PassRole
+            # Deterministic name created by the worker stack with the same EnvironmentName.
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-mineru-gateway-worker"
+            Condition:
+              StringEquals:
+                iam:PassedToService: ec2.amazonaws.com
+          - Sid: ReadWorkerLaunchTemplateRef
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/mineru-gateway/*"
+          - Sid: ResultsBucketAccess
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub
+                - "arn:aws:s3:::${Bucket}"
+                - Bucket: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+          - Sid: ResultsObjectAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource:
+              - !Sub
+                - "arn:aws:s3:::${Bucket}/*"
+                - Bucket: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
+
+  ControllerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-mineru-gateway-controller"
+      Roles:
+        - !Ref ControllerInstanceRole
+
+  ControllerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-mineru-gateway-controller"
+      GroupDescription: "mineru-gateway controller - NO inbound (SSM Session Manager only). Workers accept 8000/8001 from this group; operators tunnel the gateway port via SSM port forwarding."
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: SSM service, docker registry, S3, package repos
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-controller"
+
+  ControllerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref ControllerInstanceProfile
+      # Deliberately NO KeyName: SSM Session Manager is the only way in.
+      # No public IP: the subnet maps none by default (MapPublicIpOnLaunch=false).
+      SubnetId: !Ref PrivateSubnetId
+      SecurityGroupIds:
+        - !Ref ControllerSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      Monitoring: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mineru-gateway-controller"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/controller-setup.log 2>&1
+          dnf update -y
+          dnf install -y --allowerasing docker git curl
+          # AL2023 repos have no docker-compose-plugin — install compose v2 from upstream.
+          dnf install -y docker-compose-plugin || {
+            mkdir -p /usr/local/lib/docker/cli-plugins
+            curl -fsSL https://github.com/docker/compose/releases/download/v2.35.0/docker-compose-linux-aarch64 \
+              -o /usr/local/lib/docker/cli-plugins/docker-compose
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+          }
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          # SSM agent ships with AL2023 and needs no config with the managed policy attached.
+          systemctl enable --now amazon-ssm-agent || true
+          echo "mineru-gateway controller ready (docker $(docker --version))"
+
+Outputs:
+  InstanceId:
+    Description: SSM target for the controller — aws ssm start-session --target <id>
+    Value: !Ref ControllerInstance
+
+  SecurityGroupId:
+    Description: >
+      Pass as GatewaySecurityGroupId to the worker stack (mineru-worker.yaml) — workers allow
+      8000/8001 inbound from this group only.
+    Value: !Ref ControllerSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+  RoleName:
+    Description: >
+      Pass as HostRoleName to the worker stack — it grants this role iam:PassRole on the
+      worker role it creates.
+    Value: !Ref ControllerInstanceRole
+
+  ResultsBucketName:
+    Description: >
+      Results bucket (created here unless an existing name was given). Same value goes to the
+      worker stack's ResultsBucket and to cloud.aws.bucket in the gateway config.
+    Value: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]

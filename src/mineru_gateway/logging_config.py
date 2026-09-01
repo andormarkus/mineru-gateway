@@ -25,6 +25,11 @@ def configure_logging(level: str | int = "INFO") -> int:
     """Configure process-wide logging. Returns the resolved numeric level."""
     numeric = resolve_log_level(level)
     logging.basicConfig(level=numeric, format=DEFAULT_LOG_FORMAT, stream=sys.stderr, force=True)
-    for name in _QUIET_LOGGERS:
-        logging.getLogger(name).setLevel(max(numeric, logging.WARNING))
+    apply_quiet_loggers(numeric)
     return numeric
+
+
+def apply_quiet_loggers(level: int) -> None:
+    """Raise httpx/botocore loggers to WARNING unless root level is DEBUG."""
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(max(level, logging.WARNING))

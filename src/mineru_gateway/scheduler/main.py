@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
     "--log-level", default=None, help="Log level (DEBUG, INFO, WARNING, ERROR). Defaults to config log_level or INFO."
 )
 def main(config_path: str, database_url: str | None, log_level: str | None) -> None:
-    """Run the mineru-gateway scheduler process (single sequential tick loop)."""
+    """Run the mineru-gateway scheduler process."""
     settings, resolved_level = load_settings_from_cli(
         config_path=config_path, database_url=database_url, log_level=log_level
     )

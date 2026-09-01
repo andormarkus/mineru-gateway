@@ -17,7 +17,7 @@ from mineru_gateway.cloud.registry import (
     init_provider,
     init_store,
 )
-from mineru_gateway.config import load_settings, reset_settings_cache
+from mineru_gateway.config import get_settings, load_settings, reset_settings_cache
 
 
 def _create_s3_bucket(endpoint: str, bucket: str, *, region: str = "us-east-1") -> None:
@@ -58,7 +58,7 @@ def test_get_store_unknown_raises() -> None:
 
 
 def test_init_provider_returns_none_when_cloud_workers_disabled() -> None:
-    settings = load_settings()
+    settings = get_settings()
     provider = init_provider(settings)
     assert provider is None
 

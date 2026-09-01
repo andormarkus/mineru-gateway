@@ -146,7 +146,7 @@ ocr:
   - model_name: mineru
     litellm_params:
       model: ocr/mineru
-      api_base: http://<gateway-host>:8000
+      api_base: http://<controller>:8000
       api_key: <your-api-key>   # when auth.enabled: true
 ```
 
@@ -251,10 +251,135 @@ cloud:
     region: us-east-1
     bucket: mineru-results
     launch_template_id: lt-0abc123
-    launch_template_version: "$Default"
+    launch_template_version: "$Latest"
 ```
 
-Worker VMs must run `mineru-api` (or equivalent) and register with the scheduler. The launch template should tag instances with the gateway's deployment identity.
+Workers are addressed **by private IP only** — there is no public-worker mode. The scheduler must run in the same VPC as the workers (the sandbox host is).
+
+Workers are stock upstream `mineru-api` instances — nothing registers with the
+gateway. The scheduler launches them via the launch template, discovers them by
+deployment tags, health-checks `:8000`, polls `:8001` for bootstrap progress
+while they build, dispatches tasks, and terminates them when idle.
+
+Provision the infrastructure with the CloudFormation stacks in
+`deploy/cloudformation/`:
+
+| Template | Purpose |
+|----------|---------|
+| `controller.yaml` | **The controller** — the control plane: t4g instance running gateway + scheduler + Postgres (compose), plus (by default) the results S3 bucket with lifecycle rules. Private subnet, SSM-only, zero inbound. |
+| `mineru-worker.yaml` | Worker launch template, IAM role, SG: workers in a **private subnet**, no public IPs, `:8000`/`:8001` reachable only from the controller SG. Publishes the launch-template id to SSM Parameter Store. |
+
+The worker stack cannot raise GPU service quota (`L-DB2E81BA`) for you — no
+CloudFormation stack can; it needs account-side approval (see onboarding).
+
+### Sandbox deployment (SSM, closed topology)
+
+The v1 sandbox topology: everything private, zero inbound ports, operated via
+SSM Session Manager. The whole stack is repeatable — launch, deploy, iterate,
+remove. **Starting from an empty AWS account?** Do
+[`docs/ONBOARDING_A_NEW_ACCOUNT.md`](docs/ONBOARDING_A_NEW_ACCOUNT.md) first —
+network (public + private subnets with NAT) and the GPU quota request that
+gates everything; the bucket comes with the controller stack.
+
+```
+ ┌──────────────────────────────── VPC ────────────────────────────────┐
+ │ public subnet (NAT only)           private subnets                 │
+ │ ┌───────────────┐                  ┌────────────────┐ ┌─────────┐ │
+ │ │ NAT gateway   │◀──── egress ──────│ controller     │ │ GPU     │ │
+ │ └───────────────┘                  │ gateway+worker │─▶ workers │ │
+ │                no public IPs:      │ scheduler, pg  │ │ g5/g6,  │ │
+ │                everything below    │ (t4g, compose) │ │ 0..2    │ │
+ │                runs in private     └───────┬────────┘ └────┬────┘ │
+ │                subnets                     │ 8000/8001 only│ S3    │
+ └───────────────┼────────────────────────────┼───────────────┼──────┘
+                 │ SSM agent outbound 443     │               │
+            operator laptop            results bucket ◀───────┘
+```
+
+**How do you reach a controller with no public IP?** The SSM agent on the
+instance opens an *outbound* TLS connection to the AWS SSM service; `aws ssm
+start-session` talks to that same service, which relays your session through
+it. Nothing ever connects inbound to the controller — that is why its security
+group has no inbound rules and why it can sit in a private subnet.
+
+**1 — Controller stack** (~$0.04/hr t4g.medium). Creates the control-plane
+instance *and*, unless you pass an existing bucket, the results bucket with
+lifecycle rules. Create it first — the worker stack grants its SG ingress and
+the `iam:PassRole` permission to the controller's role:
+
+```bash
+aws cloudformation create-stack --stack-name mineru-controller \
+  --template-body file://deploy/cloudformation/controller.yaml \
+  --parameters \
+    ParameterKey=VpcId,ParameterValue=vpc-... \
+    ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
+    ParameterKey=EnvironmentName,ParameterValue=sandbox \
+  --capabilities CAPABILITY_NAMED_IAM
+# Outputs used below: InstanceId, SecurityGroupId, RoleName, ResultsBucketName
+```
+
+**2 — Worker stack** (private subnet; takes the controller SG, role, and
+bucket from step 1):
+
+```bash
+aws cloudformation create-stack --stack-name mineru-worker-sandbox \
+  --template-body file://deploy/cloudformation/mineru-worker.yaml \
+  --parameters \
+    ParameterKey=VpcId,ParameterValue=vpc-... \
+    ParameterKey=PrivateSubnetId,ParameterValue=subnet-... \
+    ParameterKey=GatewaySecurityGroupId,ParameterValue=<controller SecurityGroupId> \
+    ParameterKey=HostRoleName,ParameterValue=<controller RoleName> \
+    ParameterKey=ResultsBucket,ParameterValue=<controller ResultsBucketName> \
+    ParameterKey=EnvironmentName,ParameterValue=sandbox \
+  --capabilities CAPABILITY_NAMED_IAM
+# The stack publishes its LaunchTemplateId to SSM at
+# /mineru-gateway/sandbox/launch-template-id — the gateway config reads it
+# from there; no lt- ids are ever copy-pasted.
+```
+
+**3 — Deploy the stack over SSM** (no SSH, no keys, no open ports):
+
+```bash
+CTRL=$(aws cloudformation describe-stacks --stack-name mineru-controller \
+  --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text)
+
+aws ssm send-command --instance-ids "$CTRL" \
+  --document-name AWS-RunShellScript --comment "deploy mineru-gateway" \
+  --commands 'git clone https://github.com/andormarkus/mineru-gateway.git ~/mineru-gateway &&
+              cd ~/mineru-gateway && git checkout v0.1.0 &&
+              cd deploy/compose &&
+              cp .env.example .env && sed -i "s/change-me/$(openssl rand -hex 24)/" .env &&
+              cp config.sandbox.yaml.example config.yaml &&
+              docker compose -f docker-compose.sandbox.yml up -d --build'
+# then edit ~/mineru-gateway/deploy/compose/config.yaml on the controller:
+#   api_key, bucket, and the SAME postgres password as .env
+#   (launch_template_id already points at the SSM parameter)
+```
+
+**4 — Operate:**
+
+```bash
+aws ssm start-session --target "$CTRL"    # interactive shell
+aws ssm start-session --target "$CTRL" \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}'
+curl http://127.0.0.1:8000/health          # gateway through the tunnel
+```
+
+**5 — Remove the controller** (GPU workers drain to zero on their own via
+`idle_cooldown_seconds`; the controller is the only fixed compute cost — the
+bucket is retained):
+
+```bash
+aws cloudformation delete-stack --stack-name mineru-controller
+```
+
+**Scale-from-zero contract.** With `min_workers: 0` the fleet costs nothing
+idle, but the first request pays the worker cold boot — 10+ minutes on first
+launch (the user-data builds the MinerU image; later boots are faster). That
+outlasts the 300s sync-poll SLA: `/v1/ocr` and `/file_parse` return
+`202 + task_id` while execution continues, and callers should prefer the async
+`/tasks` flow. Cached documents return instantly regardless of fleet state.
 
 ## API reference (summary)
 
@@ -283,11 +408,19 @@ Full request/response schemas: `/docs` (Swagger UI) or `/openapi.json`.
 task install          # uv sync --all-extras
 task lint             # ruff check + format
 task typecheck        # pyright
-task test             # unit tests (no Docker)
-task test-integration # Docker: testcontainers + SeaweedFS
-task test-postgres    # PostgreSQL-specific tests
-task checks-full      # lint + typecheck + full test suite
+task checks           # lint + typecheck + unit + postgres (the pre-commit combo)
+task checks-full      # everything below except slow/e2e
 ```
+
+Test tiers (all skip cleanly when their prerequisites are missing):
+
+| Command | Tier | Requires |
+|---------|------|----------|
+| `task test` | Unit — FakeWorker, in-memory store | nothing |
+| `task test-integration` | Wired paths against moto S3 | nothing (no Docker) |
+| `task test-postgres` | Migrations + advisory lock | Docker (testcontainers) |
+| `task test-slow` | Real gateway ↔ real `mineru-api` worker | `task up` + `MINERU_TEST_WORKER_URL` |
+| `task test-e2e` | Real AWS EC2 — **costs money** | `MINERU_GATEWAY_E2E=1` + launch template + bucket env |
 
 Hot-reload dev server:
 
@@ -323,6 +456,13 @@ When `attribution.enabled: true` (default), every response includes:
 - `MinerU-Version: <upstream version>`
 
 `/health` and `GET /` also expose an `upstream` block with name, version, and homepage.
+
+## Docs
+
+- [`docs/ONBOARDING_A_NEW_ACCOUNT.md`](docs/ONBOARDING_A_NEW_ACCOUNT.md) — from an empty AWS account to a running stack (network, bucket, GPU quota, both CF stacks, teardown)
+- [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) — accepted edge cases and operational safeguards
+- [`docs/REQUIRED_CHANGES_BEFORE_SHIPPING.md`](docs/REQUIRED_CHANGES_BEFORE_SHIPPING.md) — the v0.1.0 ship gate, as shipped
+- [`docs/ideas/ship-v1.md`](docs/ideas/ship-v1.md) — the scoping one-pager behind v0.1.0
 
 ## Known limitations
 

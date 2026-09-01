@@ -1,0 +1,81 @@
+# mineru-gateway sandbox stack — gateway + scheduler + Postgres on the controller.
+#
+# Runs on the EC2 controller created by deploy/cloudformation/controller.yaml.
+# The host's security group has no inbound rules; reach the gateway with an SSM
+# port-forwarding session (see README "Sandbox deployment"):
+#
+#   aws ssm start-session --target <InstanceId> \
+#     --document-name AWS-StartPortForwardingSession \
+#     --parameters '{"portNumber":["8000"],"localPortNumber":["8000"]}'
+#
+# Prerequisites in this directory (see README runbook):
+#   .env                    — GATEWAY_POSTGRES_PASSWORD=... (openssl rand -hex 24)
+#   config.yaml             — copied from config.sandbox.yaml.example, password kept in sync
+#
+#   docker compose -f docker-compose.sandbox.yml up -d --build
+
+name: mineru-gateway
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: gateway
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # One-shot: apply Alembic migrations (greenfield — 0001_initial) before the
+  # gateway and scheduler start.
+  migrate:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["alembic"]
+    command: ["upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://gateway:${GATEWAY_POSTGRES_PASSWORD}@postgres:5432/gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Exactly ONE scheduler replica (PG advisory lock guards it anyway).
+  scheduler:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["mineru-scheduler"]
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:

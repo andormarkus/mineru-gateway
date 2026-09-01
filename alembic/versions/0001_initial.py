@@ -36,6 +36,7 @@ def upgrade() -> None:
         sa.Column("retry_after", sa.DateTime(timezone=True), nullable=True),
         sa.Column("stalled_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("provisioning_detail", sa.Text(), nullable=True),
         sa.Column("ready_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("start_requested_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_active_at", sa.DateTime(timezone=True), nullable=True),

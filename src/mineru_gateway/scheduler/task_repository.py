@@ -36,7 +36,7 @@ from mineru_gateway.tasks.status import (
     apply_upstream_payload,
     normalize_upstream_status,
 )
-from mineru_gateway.util.datetime import now_utc
+from mineru_gateway.util.datetime import ensure_aware_utc, now_utc
 from mineru_gateway.util.upload_paths import internal_upload_path
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ class TaskRepository:
         self._store = store
         self._client = client
         self._workers = workers
+        self._dispatch_deferred_since: datetime | None = None
 
     @classmethod
     def for_gateway(cls, settings: GatewaySettings) -> TaskRepository:
@@ -207,8 +208,14 @@ class TaskRepository:
                 return None
             worker = await self._require_workers().acquire_dispatchable(session)
             if worker is None:
-                logger.info("Dispatch deferred task=%s reason=no_dispatchable_worker", candidate.task_id)
+                if self._dispatch_deferred_since is None:
+                    self._dispatch_deferred_since = now_utc()
+                    logger.info("Dispatch deferred task=%s reason=no_dispatchable_worker", candidate.task_id)
                 return None
+            if self._dispatch_deferred_since is not None:
+                elapsed = (now_utc() - ensure_aware_utc(self._dispatch_deferred_since)).total_seconds()
+                logger.info("Dispatch resumed after %.0fs", elapsed)
+                self._dispatch_deferred_since = None
             candidate.status = TASK_DISPATCHING
             candidate.dispatch_started_at = now_utc()
             candidate.worker_id = worker.id

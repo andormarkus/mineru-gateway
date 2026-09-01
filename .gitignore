@@ -93,3 +93,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# --- Agent session artifacts ---
+.zcode/

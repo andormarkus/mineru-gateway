@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import socket
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -76,11 +77,16 @@ async def s3_store(moto_s3_endpoint: str, monkeypatch: pytest.MonkeyPatch) -> As
 
 @pytest_asyncio.fixture
 async def app_with_store_and_worker(
-    moto_s3_endpoint: str, monkeypatch: pytest.MonkeyPatch
+    moto_s3_endpoint: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> AsyncIterator[tuple[AsyncClient, object, str, S3ObjectStore]]:
     """Full gateway app with real S3 + a FakeWorker on a real port.
 
     Yields ``(client, fake_worker_state, worker_id, s3_store)``.
+
+    The DB is a per-test file-backed sqlite: these tests run the app and a
+    background scheduler loop concurrently, and in-memory sqlite (StaticPool,
+    one shared connection) cannot carry concurrent sessions — they interleave
+    transactions on a single connection and intermittently fail refreshes.
     """
     from tests.fakes.worker import FakeWorkerState, create_fake_worker_app
 
@@ -97,11 +103,13 @@ async def app_with_store_and_worker(
     server_task = asyncio.create_task(server.serve())
     await asyncio.sleep(0.4)
 
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'gateway-integration.db'}"
+
     # --- Set AWS credentials via env (default credential chain) ---
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("MINERU_GATEWAY_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+    monkeypatch.setenv("MINERU_GATEWAY_DATABASE_URL", database_url)
 
     from unittest.mock import AsyncMock, patch
 
@@ -120,7 +128,7 @@ async def app_with_store_and_worker(
         from mineru_gateway.gateway.app import create_app
 
         await shutdown_engine()
-        init_engine("sqlite+aiosqlite:///:memory:")
+        init_engine(database_url)
         from tests.db_helpers import create_all_tables
 
         await create_all_tables()
@@ -257,11 +265,18 @@ async def test_dedup_cache_miss_then_hit(
         else:
             pytest.fail("first task did not complete with stored result")
 
-        async with get_db_session() as session:
-            cache_row = await session.get(CacheEntry, cache_key)
-        assert cache_row is not None
+        # complete_with_result() commits before populate_from_task() copies the
+        # result into the cache, so a completed task does not imply a populated
+        # cache entry yet — poll until the CAS lands.
+        for _ in range(60):
+            async with get_db_session() as session:
+                cache_row = await session.get(CacheEntry, cache_key)
+            if cache_row is not None and cache_row.object_key:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("cache entry was not populated after task completion")
         expected_object_key = cache_row.object_key
-        assert expected_object_key
         assert expected_object_key.startswith(cache_object_key(cache_key))
         assert await store.exists(expected_object_key), f"cache object missing at {expected_object_key}"
 

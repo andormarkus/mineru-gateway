@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Collection
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -15,13 +17,16 @@ from mineru_gateway.cloud.types import (
     CLOUD_STATE_PENDING,
     CLOUD_STATE_RUNNING,
     CLOUD_STATE_STOPPED,
+    CLOUD_STATE_STOPPING,
     CLOUD_STATE_TERMINATED,
+    CLOUD_STATE_TERMINATING,
     CLOUD_STATE_UNKNOWN,
 )
 from mineru_gateway.config import GatewaySettings
 from mineru_gateway.db.base import get_db_session
 from mineru_gateway.db.models import ScalingEvent, Task, Worker
 from mineru_gateway.observability.metrics import metrics
+from mineru_gateway.scheduler.scaling import ScalingInputs
 from mineru_gateway.tasks.status import (
     TASK_STATUSES_AUTOSCALE_DEMAND,
     TASK_STATUSES_COMPUTE_CAPACITY,
@@ -55,9 +60,7 @@ class WorkerRepository:
         )
 
     async def list_deployment_workers(self) -> list[Worker]:
-        async with get_db_session() as session:
-            query = select(Worker).where(self._deployment_clause())
-            return list((await session.execute(query)).scalars().all())
+        return await self._list_where(self._deployment_clause())
 
     async def commit_fields(self, worker_id: str, **fields: Any) -> None:
         if not fields:
@@ -70,6 +73,31 @@ class WorkerRepository:
             for key, value in fields.items():
                 setattr(row, key, value)
             await session.commit()
+
+    async def _count_where(self, *clauses: ColumnElement[bool]) -> int:
+        async with get_db_session() as session:
+            query = select(func.count(Worker.id)).where(*clauses)
+            return (await session.execute(query)).scalar() or 0
+
+    async def _list_where(
+        self, *clauses: ColumnElement[bool], order_by: Any = None, limit: int | None = None
+    ) -> list[Worker]:
+        async with get_db_session() as session:
+            query = select(Worker).where(*clauses)
+            if order_by is not None:
+                order_clauses = order_by if isinstance(order_by, (list, tuple)) else (order_by,)
+                query = query.order_by(*order_clauses)
+            if limit is not None:
+                query = query.limit(limit)
+            return list((await session.execute(query)).scalars().all())
+
+    async def _get_one_where(self, *clauses: ColumnElement[bool], order_by: Any = None) -> Worker | None:
+        async with get_db_session() as session:
+            query = select(Worker).where(*clauses)
+            if order_by is not None:
+                query = query.order_by(order_by)
+            query = query.limit(1)
+            return (await session.execute(query)).scalar_one_or_none()
 
     def _stalled_clause(self) -> ColumnElement[bool]:
         return Worker.failure_count >= self._settings.reconciliation.max_failure_count
@@ -85,87 +113,116 @@ class WorkerRepository:
             Worker.failure_count < self._settings.reconciliation.max_failure_count,
         )
 
+    def _health_check_clause(self) -> ColumnElement[bool]:
+        """Workers we still expect to answer health probes (excludes drain/stop wind-down)."""
+        return and_(
+            self._deployment_clause(),
+            Worker.terminated_at.is_(None),
+            Worker.base_url.isnot(None),
+            Worker.desired_state == CLOUD_STATE_RUNNING,
+            Worker.cloud_state.in_((CLOUD_STATE_RUNNING, CLOUD_STATE_PENDING)),
+            Worker.draining.is_(False),
+        )
+
     def _ready_serviceable_clause(self) -> ColumnElement[bool]:
         return and_(self._serviceable_clause(), Worker.ready_at.isnot(None))
 
     def _dispatchable_clause(self, *, active_count: ScalarSelect[int]) -> ColumnElement[bool]:
         return and_(self._serviceable_clause(), active_count < self._settings.scaling.target_per_worker)
 
+    def _task_count_subquery(self, statuses: Collection[str]) -> ScalarSelect[int]:
+        """Correlated count of a worker's tasks in ``statuses`` — used as a per-worker load signal."""
+        query = select(func.count(Task.task_id)).where(Task.worker_id == Worker.id, Task.status.in_(statuses))
+        return query.correlate(Worker).scalar_subquery()
+
     def _compute_capacity_subquery(self) -> ScalarSelect[int]:
-        return (
-            select(func.count(Task.task_id))
-            .where(Task.worker_id == Worker.id, Task.status.in_(TASK_STATUSES_COMPUTE_CAPACITY))
-            .correlate(Worker)
-            .scalar_subquery()
-        )
+        return self._task_count_subquery(TASK_STATUSES_COMPUTE_CAPACITY)
 
     def _drain_blocker_subquery(self) -> ScalarSelect[int]:
-        return (
-            select(func.count(Task.task_id))
-            .where(Task.worker_id == Worker.id, Task.status.in_(TASK_STATUSES_DRAIN_BLOCKERS))
-            .correlate(Worker)
-            .scalar_subquery()
-        )
+        return self._task_count_subquery(TASK_STATUSES_DRAIN_BLOCKERS)
 
     async def acquire_dispatchable(
         self, session: AsyncSession, *, excluded_ids: set[str] | None = None
     ) -> Worker | None:
-        excluded = excluded_ids or set()
         active_count = self._compute_capacity_subquery()
-        query = (
-            select(Worker)
-            .where(self._dispatchable_clause(active_count=active_count))
-            .order_by(active_count.asc(), Worker.last_active_at.asc().nullsfirst(), Worker.id.asc())
-            .with_for_update(skip_locked=True)
-        )
-        if excluded:
-            query = query.where(~Worker.id.in_(excluded))
-        for worker in (await session.execute(query)).scalars().all():
-            worker.last_active_at = now_utc()
-            return worker
-        return None
+        clauses: list[ColumnElement[bool]] = [self._dispatchable_clause(active_count=active_count)]
+        if excluded_ids:
+            clauses.append(~Worker.id.in_(excluded_ids))
+
+        order_by = (active_count.asc(), Worker.last_active_at.asc().nullsfirst(), Worker.id.asc())
+        query = select(Worker).where(*clauses).order_by(*order_by).with_for_update(skip_locked=True)
+
+        worker = (await session.execute(query)).scalars().first()
+        if worker is None:
+            return None
+        worker.last_active_at = now_utc()
+        return worker
 
     async def count_workers(self) -> int:
-        async with get_db_session() as session:
-            query = select(func.count(Worker.id)).where(self._deployment_clause())
-            return (await session.execute(query)).scalar() or 0
+        return await self._count_where(self._deployment_clause())
 
     async def count_serviceable_workers(self) -> int:
-        async with get_db_session() as session:
-            query = select(func.count(Worker.id)).where(self._serviceable_clause())
-            return (await session.execute(query)).scalar() or 0
+        return await self._count_where(self._serviceable_clause())
+
+    def _provisioning_clause(self) -> ColumnElement[bool]:
+        """Workers launched but not yet serviceable (pending EC2 or bootstrapping MinerU)."""
+        max_failures = self._settings.reconciliation.max_failure_count
+        launching = and_(
+            Worker.desired_state == CLOUD_STATE_RUNNING,
+            Worker.cloud_state.in_((CLOUD_STATE_PENDING, CLOUD_STATE_UNKNOWN, "starting")),
+        )
+        bootstrapping = and_(
+            Worker.desired_state == CLOUD_STATE_RUNNING,
+            Worker.cloud_state == CLOUD_STATE_RUNNING,
+            Worker.healthy.is_(False),
+            Worker.ready_at.is_(None),
+        )
+        return and_(
+            self._deployment_clause(),
+            or_(launching, bootstrapping),
+            Worker.draining.is_(False),
+            Worker.failure_count < max_failures,
+        )
 
     async def count_starting_workers(self) -> int:
-        max_failures = self._settings.reconciliation.max_failure_count
-        async with get_db_session() as session:
-            query = select(func.count(Worker.id)).where(
-                self._deployment_clause(),
-                Worker.desired_state == CLOUD_STATE_RUNNING,
-                Worker.cloud_state.in_((CLOUD_STATE_PENDING, CLOUD_STATE_UNKNOWN, "starting")),
-                Worker.draining.is_(False),
-                Worker.failure_count < max_failures,
-            )
-            return (await session.execute(query)).scalar() or 0
+        return await self._count_where(self._provisioning_clause())
+
+    def _draining_clause(self) -> ColumnElement[bool]:
+        return and_(
+            self._deployment_clause(),
+            Worker.draining.is_(True),
+            Worker.desired_state != CLOUD_STATE_TERMINATED,
+            Worker.terminated_at.is_(None),
+        )
+
+    async def count_draining_workers(self) -> int:
+        return await self._count_where(self._draining_clause())
+
+    def _stopping_clause(self) -> ColumnElement[bool]:
+        """Workers converging to stopped/terminated (EC2 stop/terminate in flight)."""
+        return and_(
+            self._deployment_clause(),
+            Worker.terminated_at.is_(None),
+            or_(
+                Worker.cloud_state.in_((CLOUD_STATE_STOPPING, CLOUD_STATE_TERMINATING)),
+                and_(
+                    Worker.desired_state.in_((CLOUD_STATE_STOPPED, CLOUD_STATE_TERMINATED)),
+                    Worker.cloud_state.notin_((CLOUD_STATE_STOPPED, CLOUD_STATE_TERMINATED)),
+                ),
+            ),
+        )
+
+    async def count_stopping_workers(self) -> int:
+        return await self._count_where(self._stopping_clause())
+
+    def _stalled_and_active_clauses(self) -> tuple[ColumnElement[bool], ...]:
+        return (self._deployment_clause(), self._stalled_clause(), Worker.desired_state != CLOUD_STATE_TERMINATED)
 
     async def find_stalled_workers(self) -> list[Worker]:
-        async with get_db_session() as session:
-            query = select(Worker).where(
-                self._deployment_clause(),
-                self._stalled_clause(),
-                Worker.desired_state != CLOUD_STATE_TERMINATED,
-                Worker.terminated_at.is_(None),
-            )
-            return list((await session.execute(query)).scalars().all())
+        return await self._list_where(*self._stalled_and_active_clauses())
 
     async def count_stalled_workers(self) -> int:
-        async with get_db_session() as session:
-            query = select(func.count(Worker.id)).where(
-                self._deployment_clause(),
-                self._stalled_clause(),
-                Worker.desired_state != CLOUD_STATE_TERMINATED,
-                Worker.terminated_at.is_(None),
-            )
-            return (await session.execute(query)).scalar() or 0
+        return await self._count_where(*self._stalled_and_active_clauses())
 
     async def count_queue_depth(self) -> int:
         async with get_db_session() as session:
@@ -173,49 +230,55 @@ class WorkerRepository:
             return (await session.execute(query)).scalar() or 0
 
     async def count_recoverable_workers(self) -> int:
-        return (await self.count_serviceable_workers()) + (await self.count_starting_workers())
+        serviceable, starting = await asyncio.gather(self.count_serviceable_workers(), self.count_starting_workers())
+        return serviceable + starting
+
+    async def collect_scaling_inputs(self) -> ScalingInputs:
+        """Load autoscale counters concurrently (independent read-only queries)."""
+        (queue_depth, serviceable_workers, starting_workers, draining_workers, stopping_workers) = await asyncio.gather(
+            self.count_queue_depth(),
+            self.count_serviceable_workers(),
+            self.count_starting_workers(),
+            self.count_draining_workers(),
+            self.count_stopping_workers(),
+        )
+        return ScalingInputs(
+            queue_depth=queue_depth,
+            serviceable_workers=serviceable_workers,
+            starting_workers=starting_workers,
+            draining_workers=draining_workers,
+            stopping_workers=stopping_workers,
+        )
 
     async def find_stopped_worker(self) -> Worker | None:
-        async with get_db_session() as session:
-            query = (
-                select(Worker)
-                .where(
-                    self._deployment_clause(),
-                    Worker.desired_state == CLOUD_STATE_STOPPED,
-                    Worker.cloud_state == CLOUD_STATE_STOPPED,
-                    Worker.instance_id.isnot(None),
-                    Worker.draining.is_(False),
-                )
-                .limit(1)
-            )
-            return (await session.execute(query)).scalar_one_or_none()
+        return await self._get_one_where(
+            self._deployment_clause(),
+            Worker.desired_state == CLOUD_STATE_STOPPED,
+            Worker.cloud_state == CLOUD_STATE_STOPPED,
+            Worker.instance_id.isnot(None),
+            Worker.draining.is_(False),
+        )
 
     async def find_idle_worker(self, *, idle_before: datetime) -> Worker | None:
+        """Return the worker idle longest that has been serviceable for the full cooldown."""
         inflight = self._drain_blocker_subquery()
-        async with get_db_session() as session:
-            query = (
-                select(Worker)
-                .where(
-                    self._deployment_clause(),
-                    Worker.desired_state == CLOUD_STATE_RUNNING,
-                    Worker.cloud_state == CLOUD_STATE_RUNNING,
-                    Worker.healthy.is_(True),
-                    Worker.draining.is_(False),
-                    Worker.replacement_for.is_(None),
-                    inflight == 0,
-                    or_(Worker.last_active_at.is_(None), Worker.last_active_at < idle_before),
-                )
-                .order_by(Worker.last_active_at.asc().nullsfirst())
-                .limit(1)
-            )
-            return (await session.execute(query)).scalar_one_or_none()
+        idle_since = func.coalesce(Worker.last_active_at, Worker.ready_at)
+        return await self._get_one_where(
+            self._deployment_clause(),
+            Worker.desired_state == CLOUD_STATE_RUNNING,
+            Worker.cloud_state == CLOUD_STATE_RUNNING,
+            Worker.healthy.is_(True),
+            Worker.draining.is_(False),
+            Worker.replacement_for.is_(None),
+            Worker.ready_at.isnot(None),
+            Worker.ready_at < idle_before,
+            inflight == 0,
+            or_(Worker.last_active_at.is_(None), Worker.last_active_at < idle_before),
+            order_by=idle_since.asc(),
+        )
 
     async def find_draining_workers(self) -> list[Worker]:
-        async with get_db_session() as session:
-            query = select(Worker).where(
-                self._deployment_clause(), Worker.draining.is_(True), Worker.desired_state != CLOUD_STATE_TERMINATED
-            )
-            return list((await session.execute(query)).scalars().all())
+        return await self._list_where(self._draining_clause())
 
     async def count_inflight_tasks(self, worker_id: str) -> int:
         async with get_db_session() as session:
@@ -234,41 +297,27 @@ class WorkerRepository:
             return (await session.execute(query)).scalar() or 0
 
     async def get_ready_replacement_for(self, worker_id: str) -> Worker | None:
-        async with get_db_session() as session:
-            query = (
-                select(Worker)
-                .where(self._ready_serviceable_clause(), Worker.replacement_for == worker_id)
-                .order_by(Worker.created_at.asc())
-                .limit(1)
-            )
-            return (await session.execute(query)).scalar_one_or_none()
+        return await self._get_one_where(
+            self._ready_serviceable_clause(), Worker.replacement_for == worker_id, order_by=Worker.created_at.asc()
+        )
 
     async def has_active_replacement_for(self, worker_id: str) -> bool:
-        async with get_db_session() as session:
-            query = select(func.count(Worker.id)).where(
-                self._deployment_clause(),
-                Worker.replacement_for == worker_id,
-                Worker.terminated_at.is_(None),
-                Worker.desired_state != CLOUD_STATE_TERMINATED,
-            )
-            return ((await session.execute(query)).scalar() or 0) > 0
+        count = await self._count_where(
+            self._deployment_clause(),
+            Worker.replacement_for == worker_id,
+            Worker.desired_state != CLOUD_STATE_TERMINATED,
+        )
+        return count > 0
 
     async def count_active_replacements(self) -> int:
-        async with get_db_session() as session:
-            query = select(func.count(Worker.id)).where(
-                self._deployment_clause(),
-                Worker.replacement_for.isnot(None),
-                Worker.desired_state != CLOUD_STATE_TERMINATED,
-                Worker.terminated_at.is_(None),
-            )
-            return (await session.execute(query)).scalar() or 0
+        return await self._count_where(
+            self._deployment_clause(),
+            Worker.replacement_for.isnot(None),
+            Worker.desired_state != CLOUD_STATE_TERMINATED,
+        )
 
     async def find_replacement_workers(self) -> list[Worker]:
-        async with get_db_session() as session:
-            query = select(Worker).where(
-                self._deployment_clause(), Worker.replacement_for.isnot(None), Worker.terminated_at.is_(None)
-            )
-            return list((await session.execute(query)).scalars().all())
+        return await self._list_where(self._deployment_clause(), Worker.replacement_for.isnot(None))
 
     def _rotation_eligible_clause(self) -> ColumnElement[bool]:
         return and_(
@@ -282,50 +331,31 @@ class WorkerRepository:
         )
 
     async def find_emergency_rotation_target(self) -> Worker | None:
-        async with get_db_session() as session:
-            query = (
-                select(Worker)
-                .where(self._rotation_eligible_clause(), Worker.rotation_requested.is_(True))
-                .order_by(Worker.created_at.asc())
-                .limit(1)
-            )
-            return (await session.execute(query)).scalar_one_or_none()
+        return await self._get_one_where(
+            self._rotation_eligible_clause(), Worker.rotation_requested.is_(True), order_by=Worker.created_at.asc()
+        )
 
     async def find_scheduled_rotation_target(self, *, created_before: datetime) -> Worker | None:
-        async with get_db_session() as session:
-            query = (
-                select(Worker)
-                .where(
-                    self._rotation_eligible_clause(), Worker.created_at.isnot(None), Worker.created_at < created_before
-                )
-                .order_by(Worker.created_at.asc())
-                .limit(1)
-            )
-            return (await session.execute(query)).scalar_one_or_none()
+        return await self._get_one_where(
+            self._rotation_eligible_clause(),
+            Worker.created_at.isnot(None),
+            Worker.created_at < created_before,
+            order_by=Worker.created_at.asc(),
+        )
 
     async def find_workers_pending_termination_finalize(self) -> list[Worker]:
-        async with get_db_session() as session:
-            query = select(Worker).where(
-                self._deployment_clause(),
-                Worker.desired_state == CLOUD_STATE_TERMINATED,
-                Worker.cloud_state == CLOUD_STATE_TERMINATED,
-                Worker.terminated_at.is_(None),
-            )
-            return list((await session.execute(query)).scalars().all())
+        return await self._list_where(
+            self._deployment_clause(),
+            Worker.desired_state == CLOUD_STATE_TERMINATED,
+            Worker.cloud_state == CLOUD_STATE_TERMINATED,
+        )
 
     async def list_health_check_candidates(self, *, limit: int) -> list[Worker]:
-        async with get_db_session() as session:
-            query = (
-                select(Worker)
-                .where(
-                    Worker.deployment_id == self._settings.deployment_id,
-                    Worker.terminated_at.is_(None),
-                    Worker.base_url.isnot(None),
-                )
-                .order_by(Worker.last_health_checked_at.asc().nullsfirst(), Worker.id.asc())
-                .limit(limit)
-            )
-            return list((await session.execute(query)).scalars().all())
+        return await self._list_where(
+            self._health_check_clause(),
+            order_by=(Worker.last_health_checked_at.asc().nullsfirst(), Worker.id.asc()),
+            limit=limit,
+        )
 
     async def _record_scaling_event(
         self,
@@ -402,10 +432,10 @@ class WorkerRepository:
                 error,
             )
 
-    async def apply_health_checks(self, results: list[tuple[Worker, bool, str | None]]) -> int:
+    async def apply_health_checks(self, results: list[tuple[Worker, bool, str | None, bool]]) -> int:
         healthy_count = 0
         async with get_db_session() as session:
-            for worker, ok, error in results:
+            for worker, ok, error, provisioning in results:
                 row = await session.get(Worker, worker.id)
                 if row is None:
                     continue
@@ -413,6 +443,7 @@ class WorkerRepository:
                 if ok:
                     row.healthy = True
                     row.last_error = None
+                    row.provisioning_detail = None
                     if (
                         row.desired_state == CLOUD_STATE_RUNNING
                         and row.cloud_state == CLOUD_STATE_RUNNING
@@ -424,7 +455,10 @@ class WorkerRepository:
                     metrics.record_health_check(outcome="healthy")
                 else:
                     row.healthy = False
-                    row.last_error = error
+                    if provisioning:
+                        row.provisioning_detail = error
+                    else:
+                        row.last_error = error
                     metrics.record_health_check(outcome="unhealthy")
             await session.commit()
         return healthy_count
@@ -476,9 +510,8 @@ class WorkerRepository:
 
     async def finalize_terminated_worker(self, worker_id: str) -> None:
         async with get_db_session() as session:
-            replacements = (
-                (await session.execute(select(Worker).where(Worker.replacement_for == worker_id))).scalars().all()
-            )
+            query = select(Worker).where(Worker.replacement_for == worker_id)
+            replacements = (await session.execute(query)).scalars().all()
             for repl in replacements:
                 repl.replacement_for = None
             row = await session.get(Worker, worker_id)
@@ -516,9 +549,7 @@ class WorkerRepository:
             return row
 
     async def list_workers(self) -> list[Worker]:
-        async with get_db_session() as session:
-            query = select(Worker).where(self._deployment_clause()).order_by(Worker.created_at)
-            return list((await session.execute(query)).scalars().all())
+        return await self._list_where(self._deployment_clause(), order_by=Worker.created_at)
 
     async def set_drain_intent(
         self, worker_id: str, *, drain_target: str, reason: str, requester: str | None = None

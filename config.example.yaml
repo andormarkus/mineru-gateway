@@ -27,7 +27,11 @@ log_level: "INFO"
 # Soft upload limit in bytes (0 = only the 1 GiB hard cap applies). Cannot exceed the hard maximum.
 # Configure the reverse proxy or ingress with the same or smaller request-body limit so multipart
 # parsing cannot spool unbounded data before these checks run.
-max_file_size_bytes: 0
+max_file_size_bytes: 104857600    # 100 MiB
+
+# Cloud workers: true lets the scheduler launch/terminate EC2 GPU workers via the
+# launch template below. false = manually registered workers only (Tier-3 setups).
+cloud_workers_enabled: false
 
 scaling:
   # Target-tracking on queued/dispatching/processing tasks per serviceable worker.
@@ -37,15 +41,16 @@ scaling:
   idle_cooldown_seconds: 300      # stop a worker idle longer than this
   scale_up_cooldown_seconds: 60   # prevent thrash between scale-ups
 
-# Internal API key (required for non-probe endpoints in production).
+# Internal API key — required for all non-probe endpoints. The startup guard
+# refuses to bind on a public interface unless auth is enabled with a key.
+# Replace the placeholder with a real secret (e.g. `openssl rand -hex 32`).
 auth:
-  enabled: false
-  api_key: null
+  enabled: true
+  api_key: "change-me-openssl-rand-hex-32"
 
 scheduler:
-  # Single scheduler process; PostgreSQL advisory lock prevents overlap in prod.
-  # Run replicas: 1 (K8s Recreate strategy) or ECS desired count 1.
-  poll_interval_seconds: 10
+  dispatch_poll_interval_seconds: 0.5
+  reconcile_poll_interval_seconds: 15
 
 reconciliation:
   launch_readiness_timeout_seconds: 1800
@@ -57,7 +62,6 @@ rotation:
   readiness_timeout_seconds: 1800
 
 retention:
-  # Scheduler deletes expired task payloads/results and cache objects.
   retention_days: 30
   cleanup_interval_seconds: 3600  # hourly
 
@@ -77,8 +81,12 @@ cloud:
     endpoint_url: "http://localhost:8333"
     # EC2: moto/local only; omit ec2_endpoint_url for AWS EC2 in prod.
     ec2_endpoint_url: null
+    # Either a literal "lt-..." id, or an SSM Parameter Store reference the
+    # worker stack publishes: "ssm:/mineru-gateway/<environment>/launch-template-id".
     launch_template_id: null
-    launch_template_version: "$Default"
+    launch_template_version: "$Latest"
+    # Workers live in private subnets; the scheduler reaches them via private
+    # IPs. There is no public-worker mode.
 
 attribution:
   # MinerU LICENSE §2: online services built on MinerU must clearly indicate
