@@ -46,7 +46,7 @@ Parameters:
 
   InstanceType:
     Type: String
-    Default: g6.2xlarge
+    Default: g4dn.xlarge
     AllowedValues:
       - g4dn.xlarge
       - g4dn.2xlarge
@@ -55,7 +55,10 @@ Parameters:
       - g6.2xlarge
       - g6.4xlarge
       - p3.2xlarge
-    Description: GPU instance type (must match account quota).
+    Description: >
+      GPU instance type available to the account. g6 is NOT enabled on all
+      accounts/regions (RunInstances fails with Unsupported) — g4dn.xlarge is
+      the safe default (T4 16GB, Nitro, widely available).
 
   RootVolumeSizeGiB:
     Type: Number
