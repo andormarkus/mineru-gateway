@@ -142,6 +142,14 @@ Resources:
               - ec2:DescribeInstances
               - ec2:DescribeInstanceTypes
             Resource: "*"
+          - Sid: PassWorkerRoleOnLaunch
+            Effect: Allow
+            Action: iam:PassRole
+            # Deterministic name created by the worker stack with the same EnvironmentName.
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-mineru-gateway-worker"
+            Condition:
+              StringEquals:
+                iam:PassedToService: ec2.amazonaws.com
           - Sid: ReadWorkerLaunchTemplateRef
             Effect: Allow
             Action: ssm:GetParameter

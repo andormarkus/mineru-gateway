@@ -15,7 +15,6 @@ Metadata:
           - VpcId
           - PrivateSubnetId
           - GatewaySecurityGroupId
-          - HostRoleName
       - Label:
           default: Worker instance
         Parameters:
@@ -44,12 +43,6 @@ Parameters:
   GatewaySecurityGroupId:
     Type: AWS::EC2::SecurityGroup::Id
     Description: Security group of the gateway host — allowed inbound on worker :8000 and :8001.
-
-  HostRoleName:
-    Type: String
-    Description: >
-      IAM role name of the controller (controller.yaml RoleName output). This stack
-      grants it iam:PassRole on the worker role so the scheduler can launch workers.
 
   InstanceType:
     Type: String
@@ -149,23 +142,6 @@ Resources:
       InstanceProfileName: !Sub "${EnvironmentName}-mineru-gateway-worker"
       Roles:
         - !Ref WorkerInstanceRole
-
-  HostPassRolePolicy:
-    Type: AWS::IAM::Policy
-    Properties:
-      PolicyName: !Sub "${EnvironmentName}-mineru-gateway-host-passrole"
-      Roles:
-        - !Ref HostRoleName
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: LaunchWorkersWithWorkerRole
-            Effect: Allow
-            Action: iam:PassRole
-            Resource: !GetAtt WorkerInstanceRole.Arn
-            Condition:
-              StringEquals:
-                iam:PassedToService: ec2.amazonaws.com
 
   LaunchTemplateSsmParameter:
     Type: AWS::SSM::Parameter
