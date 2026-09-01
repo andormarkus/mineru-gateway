@@ -83,6 +83,7 @@ Resources:
     Type: AWS::S3::Bucket
     Condition: CreateBucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Sub "${AWS::AccountId}-${EnvironmentName}-mineru-results"
       PublicAccessBlockConfiguration:
@@ -93,15 +94,15 @@ Resources:
       LifecycleConfiguration:
         Rules:
           - Id: expire-payloads
-            Filter: {Prefix: payloads/}
+            Prefix: payloads/
             Status: Enabled
             ExpirationInDays: 7
           - Id: expire-results
-            Filter: {Prefix: results/}
+            Prefix: results/
             Status: Enabled
             ExpirationInDays: 90
           - Id: expire-cache
-            Filter: {Prefix: cache/}
+            Prefix: cache/
             Status: Enabled
             ExpirationInDays: 90
 
@@ -178,11 +179,8 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub "${EnvironmentName}-mineru-gateway-controller"
-      GroupDescription: >
-        mineru-gateway controller — NO inbound (SSM Session Manager only). Workers accept
-        8000/8001 from this group; operators tunnel the gateway port via SSM port forwarding.
+      GroupDescription: "mineru-gateway controller - NO inbound (SSM Session Manager only). Workers accept 8000/8001 from this group; operators tunnel the gateway port via SSM port forwarding."
       VpcId: !Ref VpcId
-      SecurityGroupIngress: []
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
@@ -197,12 +195,11 @@ Resources:
       ImageId: !Ref AmiId
       InstanceType: !Ref InstanceType
       IamInstanceProfile: !Ref ControllerInstanceProfile
+      # Deliberately NO KeyName: SSM Session Manager is the only way in.
+      # No public IP: the subnet maps none by default (MapPublicIpOnLaunch=false).
       SubnetId: !Ref PrivateSubnetId
       SecurityGroupIds:
         - !Ref ControllerSecurityGroup
-      # Deliberately NO KeyName: SSM Session Manager is the only way in.
-      # Deliberately NO public IP: the controller lives in a private subnet.
-      AssociatePublicIpAddress: false
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
@@ -214,8 +211,7 @@ Resources:
         HttpEndpoint: enabled
         HttpTokens: required
         HttpPutResponseHopLimit: 2
-      Monitoring:
-        Enabled: true
+      Monitoring: true
       Tags:
         - Key: Name
           Value: !Sub "${EnvironmentName}-mineru-gateway-controller"
