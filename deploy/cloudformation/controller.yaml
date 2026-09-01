@@ -141,6 +141,7 @@ Resources:
               - ec2:TerminateInstances
               - ec2:DescribeInstances
               - ec2:DescribeInstanceTypes
+              - ec2:CreateTags
             Resource: "*"
           - Sid: PassWorkerRoleOnLaunch
             Effect: Allow
