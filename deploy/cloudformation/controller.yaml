@@ -1,26 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  mineru-gateway controller — the control plane: one small always-on EC2 instance running the
-  gateway API + scheduler + Postgres via docker compose (deploy/compose/docker-compose.sandbox.yml),
-  plus (optionally) the results S3 bucket with its lifecycle safety net.
-
-  The controller runs in a PRIVATE subnet with no public IP — the whole data plane is private.
-  Egress (SSM agent, docker pulls, git, S3) goes via the VPC's NAT gateway; alternatively give
-  the subnet SSM VPC endpoints (ssm, ssmmessages, ec2messages) plus an S3 gateway endpoint.
-
-  Access is SSM Session Manager ONLY: no key pair, no SSH port, and the security group has NO
-  inbound rules. The SSM agent on the instance dials out to the SSM service.
-
-  The controller's security group is what worker stacks reference: workers in private subnets
-  accept :8000 (mineru-api) and :8001 (bootstrap status) only from this group.
-
-  The one thing this stack cannot do: raise GPU service quota (L-DB2E81BA) — AWS requires an
-  account-side approval; request it separately, ideally before deploying. New accounts start at 0.
-
-  Launch → deploy → iterate → remove:
-    aws cloudformation create-stack ...            # this template
-    aws ssm start-session --target <InstanceId>   # operate
-    aws cloudformation delete-stack ...           # stop paying (~$0.04/hr t4g.medium)
+  mineru-gateway controller — control plane: gateway API + scheduler + Postgres (docker compose)
+  on one private-subnet t4g instance, plus the results S3 bucket (public access blocked,
+  lifecycle orphan-expiry). No public IP, no key pair, zero inbound SG rules: access is SSM
+  Session Manager only (the agent dials out via the NAT route). Workers accept :8000/:8001 from
+  this SG only. Not automatable here: GPU quota L-DB2E81BA (On-Demand G/VT vCPUs) — request it
+  account-side. Operate: aws ssm start-session --target <InstanceId>.
 
 Metadata:
   AWS::CloudFormation::Interface:
