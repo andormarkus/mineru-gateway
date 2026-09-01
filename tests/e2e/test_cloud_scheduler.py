@@ -1,11 +1,12 @@
 """AWS scheduler E2E — autoscale, rotation, and drain on real EC2.
 
-Tests run in order (test_01 → test_05) sharing one session worker pool.
+Tests run in order (test_01 → test_05, incl. test_04b) sharing one session worker pool.
 Scheduler session uses a 60s idle cooldown (override via ``MINERU_GATEWAY_SCALING__IDLE_COOLDOWN_SECONDS``).
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,7 @@ from mineru_gateway.config import GatewaySettings, get_settings
 from tests.e2e.conftest import SAMPLE_PDF
 from tests.helpers.cloud import scheduler_poll_interval_seconds, wait_for_serviceable_workers
 from tests.helpers.e2e import (
+    e2e_log,
     fetch_admin_workers,
     is_serviceable_admin_worker,
     maintain_min_queue_depth,
@@ -182,6 +184,59 @@ async def test_04_autoscale_idle_drain_stops_worker(
             precondition_timeout_seconds=e2e_launch_timeout_seconds,
             poll_interval=poll,
         )
+
+
+@pytest.mark.asyncio
+async def test_04b_stopped_worker_resume_on_demand(
+    gateway_cloud_e2e_scheduler_session: tuple[AsyncClient, CloudStorageProvider],
+    e2e_launch_timeout_seconds: float,
+    e2e_worker_timeout_seconds: float,
+) -> None:
+    """A warm (stopped) worker is resumed IN PLACE when new work arrives.
+
+    Warm-pool contract: idle workers are stopped (EBS-only cost, baked MinerU
+    image on disk). Waking them must reuse the same EC2 instance — minutes —
+    instead of launching a fresh one (full image build).
+    """
+    client, store = gateway_cloud_e2e_scheduler_session
+    settings = get_settings()
+    poll = scheduler_poll_interval_seconds()
+
+    workers = await fetch_admin_workers(client)
+    stopped = [w for w in workers if w.get("desired_state") == "stopped" and w.get("cloud_state") == "stopped"]
+    assert stopped, "test_04 must leave a stopped (warm) worker to resume"
+    warm = stopped[0]
+    warm_instance = warm.get("instance_id")
+    assert warm_instance, "stopped worker must keep its instance_id for resume"
+    worker_count_before = len(workers)
+    e2e_log(f"warm-resume test: resuming {warm['id'][:8]} instance={warm_instance}", always=True)
+    started = asyncio.get_running_loop().time()
+
+    async with _e2e_scheduler(settings, store, client_timeout=e2e_worker_timeout_seconds):
+        task_id = await submit_pdf_task(client, filename=_PDF_NAME, pdf_bytes=_PDF_BYTES)
+
+        def resumed_in_place(ws: list[dict]) -> bool:
+            return any(is_serviceable_admin_worker(w) and w.get("instance_id") == warm_instance for w in ws)
+
+        await wait_for_admin_workers(
+            client,
+            predicate=resumed_in_place,
+            timeout_seconds=e2e_launch_timeout_seconds,
+            poll_interval=poll,
+            description=f"warm worker {warm['id'][:8]} resumed in place",
+        )
+
+        await wait_for_task_status_api(
+            client, task_id, expected="completed", timeout_seconds=e2e_worker_timeout_seconds, poll_interval=poll
+        )
+
+        workers_after = await fetch_admin_workers(client)
+        assert len(workers_after) == worker_count_before, (
+            f"warm resume must not create additional workers ({worker_count_before} -> {len(workers_after)})"
+        )
+
+    elapsed = asyncio.get_running_loop().time() - started
+    e2e_log(f"warm resume of {warm_instance} serviceable + task completed in {elapsed:.0f}s", always=True)
 
 
 @pytest.mark.asyncio

@@ -402,7 +402,7 @@ Resources:
             }
             
             build_mineru_image() {
-              write_status "building_docker_image" "Building MinerU image (pulls vllm/vllm-openai base + bakes in all models — can take 20-40+ min)"
+              write_status "building_docker_image" "Building MinerU image (pulls vllm/vllm-openai base + bakes in all models — typically ~10 min)"
               log "Downloading MinerU Dockerfile..."
               mkdir -p "$MINERU_BUILD_DIR"
               curl -fsSL "$MINERU_DOCKERFILE_URL" -o "${MINERU_BUILD_DIR}/Dockerfile" \
@@ -450,6 +450,64 @@ Resources:
               log "mineru-api service configured (port ${MINERU_PORT})"
             }
             
+            configure_ready_marker() {
+              write_status "configuring_ready_marker" "Installing boot-time ready marker"
+              log "Installing mineru-api ready marker service..."
+              mkdir -p "$MINERU_BUILD_DIR"
+              # Writes "ready" to the bootstrap-status file as soon as mineru-api
+              # answers on :8000 — runs on EVERY boot, so resumed (warm) workers
+              # become serviceable again instead of waiting for a readiness
+              # timeout (/var/run is tmpfs and does not survive stop/start).
+              cat > "${MINERU_BUILD_DIR}/mark_status_ready.py" <<'PYEOF'
+            import json
+            import sys
+            import time
+            import urllib.request
+
+            STATUS_FILE = "/var/run/mineru-bootstrap-status.json"
+            HEALTH_URL = "http://127.0.0.1:8000/health"
+            TIMEOUT_S = 900
+
+            deadline = time.time() + TIMEOUT_S
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    with urllib.request.urlopen(HEALTH_URL, timeout=3) as resp:
+                        if resp.status == 200:
+                            healthy = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(5)
+            status = {
+                "status": "ready" if healthy else "unhealthy",
+                "stage": "ready" if healthy else "unhealthy",
+                "detail": "mineru-api healthy on :8000" if healthy else "mineru-api not healthy within 900s",
+                "updated_at": time.time(),
+            }
+            with open(STATUS_FILE, "w") as f:
+                json.dump(status, f)
+            print("bootstrap status:", status["status"])
+            sys.exit(0 if healthy else 1)
+            PYEOF
+              cat > /etc/systemd/system/mineru-status-ready.service <<EOF
+            [Unit]
+            Description=Mark bootstrap status ready once mineru-api answers on :8000
+            After=mineru-api.service docker.service
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/bin/python3 ${MINERU_BUILD_DIR}/mark_status_ready.py
+            RemainAfterExit=true
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+              systemctl daemon-reload
+              systemctl enable mineru-status-ready.service || die "Failed to enable ready marker"
+              log "Ready marker service installed"
+            }
+
             grant_docker_permissions() {
               local user="$1"
               id "$user" &>/dev/null || { log "Creating user: ${user}"; useradd -m -s /bin/bash "$user"; }
@@ -546,6 +604,7 @@ Resources:
               configure_dev_char_symlink_service
               build_mineru_image
               configure_mineru_service
+              configure_ready_marker
               configure_users
               auto_start_service
               verify_installation

@@ -518,6 +518,47 @@ async def test_autoscale_does_not_drain_while_another_worker_draining(db_session
 
 
 @pytest.mark.asyncio
+async def test_scale_up_restarts_stopped_worker_in_place(db_session: AsyncSession) -> None:
+    """Warm-pool contract: scale-up resumes a stopped worker instead of launching a new one."""
+    await _seed_worker(
+        db_session, "warm-1", base_url=None, instance_id="i-warm-1", desired_state="stopped", cloud_state="stopped"
+    )
+    await db_session.close()
+
+    client = httpx.AsyncClient()
+    try:
+        scheduler = _make_scheduler(client)
+        assert await scheduler._scale_up() is True
+
+        async with get_db_session() as session:
+            row = await session.get(Worker, "warm-1")
+            assert row is not None
+            assert row.desired_state == "running"  # reconcile will start() the instance
+            assert row.instance_id == "i-warm-1"  # same EC2 instance resumed
+            assert row.ready_at is None  # readiness re-gated on boot
+            rows = (await session.execute(select(Worker))).scalars().all()
+            assert len(rows) == 1  # no additional worker created
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_scale_up_launches_new_worker_when_none_stopped(db_session: AsyncSession) -> None:
+    client = httpx.AsyncClient()
+    try:
+        scheduler = _make_scheduler(client)
+        assert await scheduler._scale_up() is True
+
+        async with get_db_session() as session:
+            rows = (await session.execute(select(Worker))).scalars().all()
+            assert len(rows) == 1
+            assert rows[0].desired_state == "running"
+            assert rows[0].instance_id is None  # reconcile launches the instance
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_autoscale_drains_long_idle_not_newly_ready_worker(db_session: AsyncSession) -> None:
     from datetime import timedelta
 

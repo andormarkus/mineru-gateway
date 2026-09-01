@@ -55,7 +55,7 @@ Scheduler-managed client SLA behavior is not required. Existing SLA code may be 
 
 ## Scale-from-zero cold boot
 
-With `scaling.min_workers: 0` the first request after an idle drain pays the worker cold boot. The launch-template user-data builds the MinerU Docker image on first boot (tens of minutes); later boots of the same instance type are faster but still exceed the 300s synchronous SLA. Practical consequences:
+With `scaling.min_workers: 0` the very first request after an empty fleet pays the worker cold boot. The launch-template user-data builds the MinerU Docker image on first boot (~10 minutes measured on g6.2xlarge in eu-central-1); after the first idle-drain the fleet sleeps **warm** (stopped instances, EBS-only cost, image baked on disk) and subsequent wakes resume the same instance in ~2–3 minutes. Practical consequences:
 
 - synchronous endpoints (`/v1/ocr`, `/file_parse`) return `202 + task_id` while the worker boots;
 - the async `/tasks` flow is the primary interface for cold fleets;
